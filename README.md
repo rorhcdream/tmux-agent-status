@@ -67,7 +67,7 @@ win 4: 🤖 •   (working now)
 
 ```tmux
 # ~/.tmux.conf
-set -g @plugin 'jaewoong/tmux-agent-status'   # or a local path
+set -g @plugin 'rorhcdream/tmux-agent-status'   # or a local path
 run '~/.tmux/plugins/tpm/tpm'
 ```
 
