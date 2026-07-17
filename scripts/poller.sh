@@ -80,10 +80,13 @@ snapshot_processes() {
   done < <(ps -Ao pid=,ppid=,comm= 2>/dev/null)
 }
 
-# Find a `claude` or `codex` process at or beneath the given pid (BFS,
-# depth-limited). Echoes "<pid>\t<kind>" where kind is claude|codex.
-find_agent_pid() {
-  local root="$1" depth=0 max=6
+# Find ALL `claude`/`codex` processes at or beneath the given pid (BFS,
+# depth-limited). Echoes one "<pid>\t<kind>" line per agent (kind claude|codex).
+# A single pane can host more than one agent (e.g. a claude and a codex side by
+# side); the caller aggregates their statuses. We don't descend into an agent's
+# own subtree (an agent's children aren't separate sessions).
+find_agent_pids() {
+  local root="$1" depth=0 max=6 found=1
   local -a frontier=("$root") next=()
   while [ "${#frontier[@]}" -gt 0 ] && [ "$depth" -lt "$max" ]; do
     next=()
@@ -91,7 +94,8 @@ find_agent_pid() {
     for p in "${frontier[@]}"; do
       comm="${COMM_OF[$p]:-}"
       if [ "$comm" = "claude" ] || [ "$comm" = "codex" ]; then
-        printf '%s\t%s' "$p" "$comm"; return 0
+        printf '%s\t%s\n' "$p" "$comm"; found=0
+        continue
       fi
       for child in "${!PPID_OF[@]}"; do
         [ "${PPID_OF[$child]}" = "$p" ] && next+=("$child")
@@ -100,7 +104,7 @@ find_agent_pid() {
     frontier=("${next[@]+"${next[@]}"}")
     depth=$((depth + 1))
   done
-  return 1
+  return "$found"
 }
 
 # Echoes "<status>\t<ts_ms>" for a Claude pid; ts falls back to file mtime.
@@ -198,20 +202,40 @@ reconcile() {
   thr_ms=$(( RECENT_DAYS * 86400 * 1000 ))
 
   local pane pane_pid pane_active win_active current
-  local cpid agent akind st ts base viewing final seen
+  local st ts base viewing final seen
+  local apid akind ast ats rank best win_st win_ts
 
   while IFS=$'\t' read -r pane pane_pid pane_active win_active current; do
     [ -z "${pane:-}" ] && continue
     base=""; ts=0
     viewing=0; [ "$win_active" = "1" ] && viewing=1
 
-    if agent="$(find_agent_pid "$pane_pid")"; then
-      cpid="${agent%%$'\t'*}"; akind="${agent#*$'\t'}"
+    # A pane may host several agents (e.g. a claude and a codex side by side).
+    # Report the MOST ACTIVE one — precedence busy/shell > waiting > idle, with
+    # the more recent ts breaking ties. Without this an idle codex could blank
+    # the icon of a busy claude sharing the window (and vice versa).
+    win_st=""; win_ts=0; best=0
+    while IFS=$'\t' read -r apid akind; do
+      [ -z "${apid:-}" ] && continue
       if [ "$akind" = "codex" ]; then
-        IFS=$'\t' read -r st ts < <(status_for_codex_pid "$cpid")
+        IFS=$'\t' read -r ast ats < <(status_for_codex_pid "$apid")
       else
-        IFS=$'\t' read -r st ts < <(status_for_pid "$cpid")
+        IFS=$'\t' read -r ast ats < <(status_for_pid "$apid")
       fi
+      case "$ast" in
+        busy|shell) rank=3 ;;
+        waiting)    rank=2 ;;
+        idle)       rank=1 ;;
+        *)          rank=0 ;;
+      esac
+      if [ "$rank" -gt "$best" ] \
+        || { [ "$rank" -eq "$best" ] && [ "${ats:-0}" -gt "${win_ts:-0}" ] 2>/dev/null; }; then
+        best="$rank"; win_st="$ast"; win_ts="${ats:-0}"
+      fi
+    done < <(find_agent_pids "$pane_pid")
+
+    st="$win_st"; ts="${win_ts:-0}"
+    if [ -n "$st" ]; then
       case "$st" in
         busy|shell) base="$ICON_WORKING" ;;
         waiting)
