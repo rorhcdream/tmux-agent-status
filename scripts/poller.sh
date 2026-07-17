@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
-# Background daemon: reads Claude Code's per-session status from
-# ~/.claude/sessions/<pid>.json and drives a tmux status option (default
-# @claude_status) for the pane each Claude process runs in. No Claude hooks.
+# Background daemon: reads per-session status for the coding agent running in
+# each tmux pane and drives a tmux status option (default @claude_status). Two
+# agents are supported, each with its own storage model:
+#   claude -> ~/.claude*/sessions/<pid>.json  (explicit status, keyed by pid)
+#   codex  -> ~/.codex/sessions/.../rollout-*.jsonl  (status derived from the
+#             append-only event log; pid bridged to its file via lsof, cached)
+# Both feed the same icon state machine below. No agent hooks required.
 #
 # Status mapping:
 #   busy | shell  -> working icon
@@ -76,15 +80,19 @@ snapshot_processes() {
   done < <(ps -Ao pid=,ppid=,comm= 2>/dev/null)
 }
 
-# Find a `claude` process at or beneath the given pid (BFS, depth-limited).
-find_claude_pid() {
+# Find a `claude` or `codex` process at or beneath the given pid (BFS,
+# depth-limited). Echoes "<pid>\t<kind>" where kind is claude|codex.
+find_agent_pid() {
   local root="$1" depth=0 max=6
   local -a frontier=("$root") next=()
   while [ "${#frontier[@]}" -gt 0 ] && [ "$depth" -lt "$max" ]; do
     next=()
-    local p child
+    local p child comm
     for p in "${frontier[@]}"; do
-      [ "${COMM_OF[$p]:-}" = "claude" ] && { echo "$p"; return 0; }
+      comm="${COMM_OF[$p]:-}"
+      if [ "$comm" = "claude" ] || [ "$comm" = "codex" ]; then
+        printf '%s\t%s' "$p" "$comm"; return 0
+      fi
       for child in "${!PPID_OF[@]}"; do
         [ "${PPID_OF[$child]}" = "$p" ] && next+=("$child")
       done
@@ -116,6 +124,55 @@ status_for_pid() {
   printf '%s\t%s' "$s" "$ts"
 }
 
+# --- Codex support -----------------------------------------------------------
+# Codex stores each session as an append-only event log at
+# ~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl, named by timestamp and
+# UUID (no pid). We bridge a running codex pid to its rollout via the file it
+# holds open (lsof), then cache pid->file for the process's lifetime so the
+# mapping survives the handle being closed between turns (keeps the sticky done
+# icon working). Status is derived from the last turn-boundary event.
+declare -A CODEX_FILE_OF   # codex pid -> rollout jsonl path (cached)
+
+codex_file_for_pid() {
+  local pid="$1" f
+  f="${CODEX_FILE_OF[$pid]:-}"
+  [ -n "$f" ] && [ -f "$f" ] && { printf '%s' "$f"; return 0; }
+  # Locate the rollout .jsonl the codex process currently holds open.
+  f="$(lsof -p "$pid" -Fn 2>/dev/null | sed -n 's/^n//p' \
+        | grep -m1 -E '/sessions/.*/rollout-.*\.jsonl$')"
+  [ -n "$f" ] && [ -f "$f" ] && { CODEX_FILE_OF["$pid"]="$f"; printf '%s' "$f"; return 0; }
+  return 1
+}
+
+# Echoes "<status>\t<ts_ms>" for a codex pid, derived from the rollout tail:
+#   task_started (no later task_complete) -> busy;  task_complete -> idle;
+#   turn_aborted -> cleared. ts comes from the boundary event's ISO timestamp.
+status_for_codex_pid() {
+  local pid="$1" f out ev tsms st=""
+  f="$(codex_file_for_pid "$pid")" || { printf '\t0'; return; }
+  # One jq pass over the tail: take the LAST turn-boundary event, emit
+  # "<type>\t<epoch_ms>" (ms parsed from its ISO8601 .timestamp).
+  out="$(tail -n 80 "$f" 2>/dev/null | jq -rs '
+    ([ .[]
+       | {t: (.payload.type // .type // ""), ts: (.timestamp // "")}
+       | select(.t=="task_started" or .t=="task_complete" or .t=="turn_aborted") ]
+     | last) as $e
+    | if $e == null then empty
+      else $e.t + "\t"
+        + ((try (($e.ts | sub("\\.[0-9]+";"") | fromdateiso8601) * 1000) catch 0) | tostring)
+      end' 2>/dev/null)"
+  [ -n "$out" ] || { printf '\t0'; return; }
+  ev="${out%%$'\t'*}"
+  tsms="${out#*$'\t'}"
+  case "$ev" in
+    task_started)  st="busy" ;;
+    task_complete) st="idle" ;;
+    *)             st="" ;;
+  esac
+  case "$tsms" in ''|0|null) tsms="$(file_mtime "$f")000"; [ "$tsms" = "000" ] && tsms=0 ;; esac
+  printf '%s\t%s' "$st" "$tsms"
+}
+
 set_pane_status() {
   # set_pane_status <pane_id> <current> <desired>
   local pane="$1" current="$2" desired="$3"
@@ -130,20 +187,31 @@ set_pane_status() {
 reconcile() {
   snapshot_processes
 
+  # Drop cached codex rollout handles for processes that have exited.
+  local _p
+  for _p in "${!CODEX_FILE_OF[@]}"; do
+    [ -n "${PPID_OF[$_p]:-}" ] || unset 'CODEX_FILE_OF[$_p]'
+  done
+
   local now_ms thr_ms
   now_ms=$(( $(date +%s) * 1000 ))
   thr_ms=$(( RECENT_DAYS * 86400 * 1000 ))
 
   local pane pane_pid pane_active win_active current
-  local cpid st ts base viewing final seen
+  local cpid agent akind st ts base viewing final seen
 
   while IFS=$'\t' read -r pane pane_pid pane_active win_active current; do
     [ -z "${pane:-}" ] && continue
     base=""; ts=0
     viewing=0; [ "$win_active" = "1" ] && viewing=1
 
-    if cpid="$(find_claude_pid "$pane_pid")"; then
-      IFS=$'\t' read -r st ts < <(status_for_pid "$cpid")
+    if agent="$(find_agent_pid "$pane_pid")"; then
+      cpid="${agent%%$'\t'*}"; akind="${agent#*$'\t'}"
+      if [ "$akind" = "codex" ]; then
+        IFS=$'\t' read -r st ts < <(status_for_codex_pid "$cpid")
+      else
+        IFS=$'\t' read -r st ts < <(status_for_pid "$cpid")
+      fi
       case "$st" in
         busy|shell) base="$ICON_WORKING" ;;
         waiting)
