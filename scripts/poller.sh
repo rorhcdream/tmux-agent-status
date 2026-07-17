@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Background daemon: reads per-session status for the coding agent running in
-# each tmux pane and drives a tmux status option (default @claude_status). Two
+# each tmux pane and drives a tmux status option (default @agent_status). Two
 # agents are supported, each with its own storage model:
 #   claude -> ~/.claude*/sessions/<pid>.json  (explicit status, keyed by pid)
 #   codex  -> ~/.codex/sessions/.../rollout-*.jsonl  (status derived from the
@@ -19,29 +19,29 @@
 # icon. Set RECENT_DAYS to 0 (or an empty marker) to disable.
 #
 # Configured via env vars set by the .tmux entry script:
-#   CLAUDE_STATUS_SOCKET, CLAUDE_STATUS_INTERVAL, CLAUDE_STATUS_VAR,
-#   CLAUDE_STATUS_ICON_WORKING/WAITING/DONE,
-#   CLAUDE_STATUS_RECENT_MARKER, CLAUDE_STATUS_RECENT_DAYS
+#   AGENT_STATUS_SOCKET, AGENT_STATUS_INTERVAL, AGENT_STATUS_VAR,
+#   AGENT_STATUS_ICON_WORKING/WAITING/DONE,
+#   AGENT_STATUS_RECENT_MARKER, AGENT_STATUS_RECENT_DAYS
 
 set -uo pipefail
 
-SOCKET="${CLAUDE_STATUS_SOCKET:-}"
-INTERVAL="${CLAUDE_STATUS_INTERVAL:-2}"
-STATUS_VAR="${CLAUDE_STATUS_VAR:-@claude_status}"
-ICON_WORKING="${CLAUDE_STATUS_ICON_WORKING:-🤖}"
-ICON_WAITING="${CLAUDE_STATUS_ICON_WAITING:-💬}"
-ICON_DONE="${CLAUDE_STATUS_ICON_DONE:-✅}"
-RECENT_MARKER="${CLAUDE_STATUS_RECENT_MARKER:-•}"
-RECENT_DAYS="${CLAUDE_STATUS_RECENT_DAYS:-3}"
+SOCKET="${AGENT_STATUS_SOCKET:-}"
+INTERVAL="${AGENT_STATUS_INTERVAL:-2}"
+STATUS_VAR="${AGENT_STATUS_VAR:-@agent_status}"
+ICON_WORKING="${AGENT_STATUS_ICON_WORKING:-🤖}"
+ICON_WAITING="${AGENT_STATUS_ICON_WAITING:-💬}"
+ICON_DONE="${AGENT_STATUS_ICON_DONE:-✅}"
+RECENT_MARKER="${AGENT_STATUS_RECENT_MARKER:-•}"
+RECENT_DAYS="${AGENT_STATUS_RECENT_DAYS:-3}"
 
 # Claude config dirs to scan for sessions/<pid>.json (space-separated). When
 # Claude runs under more than one config dir (via CLAUDE_CONFIG_DIR), session
 # files are split across them, so this global daemon watches them ALL. We
 # deliberately do NOT restrict to the launching shell's CLAUDE_CONFIG_DIR: the
 # daemon is server-wide and must cover every config, not just whichever one
-# happened to spawn it. Set CLAUDE_STATUS_CONFIG_DIRS to override with an
+# happened to spawn it. Set AGENT_STATUS_CONFIG_DIRS to override with an
 # explicit space-separated list.
-CONFIG_DIRS="${CLAUDE_STATUS_CONFIG_DIRS:-}"
+CONFIG_DIRS="${AGENT_STATUS_CONFIG_DIRS:-}"
 if [ -z "$CONFIG_DIRS" ]; then
   # Every ~/.claude*/ that actually has a sessions/ dir.
   for _d in "$HOME"/.claude*/; do
@@ -222,14 +222,14 @@ reconcile() {
           # Sticky done: cleared once the window has been viewed at/after this
           # completion, and stays cleared until a NEW completion (newer
           # statusUpdatedAt) arrives. "Seen" is a per-window tmux option
-          # (@claude_status_seen) stamped by the after-select-window hook the
+          # (@agent_status_seen) stamped by the after-select-window hook the
           # moment you view a window — so it survives quick visits the 2s poll
           # would otherwise miss, and daemon restarts. We also stamp it here
           # while you're actively viewing (covers completing while watched).
-          seen="$(tm show-option -wqv -t "$pane" @claude_status_seen 2>/dev/null)"
+          seen="$(tm show-option -wqv -t "$pane" @agent_status_seen 2>/dev/null)"
           seen="${seen:-0}"
           if [ "$viewing" = "1" ]; then
-            tm set-option -w -t "$pane" @claude_status_seen "$ts" >/dev/null 2>&1 || true
+            tm set-option -w -t "$pane" @agent_status_seen "$ts" >/dev/null 2>&1 || true
             base=""
           elif [ "$seen" -ge "$ts" ] 2>/dev/null; then
             base=""
@@ -255,22 +255,22 @@ reconcile() {
     # trigger time when working) so consumers can sort by it. Unlike
     # window_activity it does NOT churn while a session keeps running.
     if [ -n "$base" ] && [ "$ts" -gt 0 ] 2>/dev/null; then
-      [ "$(tm show-option -wqv -t "$pane" @claude_status_ts 2>/dev/null)" = "$ts" ] \
-        || tm set-option -w -t "$pane" @claude_status_ts "$ts" >/dev/null 2>&1 || true
+      [ "$(tm show-option -wqv -t "$pane" @agent_status_ts 2>/dev/null)" = "$ts" ] \
+        || tm set-option -w -t "$pane" @agent_status_ts "$ts" >/dev/null 2>&1 || true
     else
-      tm set-option -w -u -t "$pane" @claude_status_ts >/dev/null 2>&1 || true
+      tm set-option -w -u -t "$pane" @agent_status_ts >/dev/null 2>&1 || true
     fi
   done < <(tm list-panes -a -F "#{pane_id}	#{pane_pid}	#{pane_active}	#{window_active}	#{$STATUS_VAR}" 2>/dev/null)
 }
 
 # One-shot mode: reconcile once and exit (for testing / manual refresh).
-if [ -n "${CLAUDE_STATUS_ONESHOT:-}" ]; then
+if [ -n "${AGENT_STATUS_ONESHOT:-}" ]; then
   reconcile
   exit 0
 fi
 
 # Clean up our recorded PID on exit.
-trap 'tm set-option -gu @claude_status_pid >/dev/null 2>&1 || true' EXIT
+trap 'tm set-option -gu @agent_status_pid >/dev/null 2>&1 || true' EXIT
 
 while true; do
   server_alive || exit 0

@@ -15,7 +15,7 @@ if [ "${1:-}" = "mark-seen" ]; then
   # Ceil to end-of-second (+999): macOS `date` has no ms, but statusUpdatedAt
   # does — a floored stamp would be < a completion ts in the same second, so a
   # quick visit right as the agent finishes wouldn't clear the done icon.
-  tmux set-option -w -t "${2:-}" @claude_status_seen "$(( $(date +%s) * 1000 + 999 ))" 2>/dev/null || true
+  tmux set-option -w -t "${2:-}" @agent_status_seen "$(( $(date +%s) * 1000 + 999 ))" 2>/dev/null || true
   exit 0
 fi
 
@@ -27,35 +27,35 @@ tmux_opt() {
 }
 
 # --- User-tunable options (set with `set -g @... ...` in tmux.conf) ---
-INTERVAL="$(tmux_opt @claude_status_interval 2)"
-ICON_WORKING="$(tmux_opt @claude_status_working '🤖')"
-ICON_WAITING="$(tmux_opt @claude_status_waiting '💬')"
-ICON_DONE="$(tmux_opt @claude_status_done '✅')"
-SET_FORMAT="$(tmux_opt @claude_status_set_format 1)"
-RECENT_MARKER="$(tmux_opt @claude_status_recent_marker '•')"
-RECENT_DAYS="$(tmux_opt @claude_status_recent_days 3)"
+INTERVAL="$(tmux_opt @agent_status_interval 2)"
+ICON_WORKING="$(tmux_opt @agent_status_working '🤖')"
+ICON_WAITING="$(tmux_opt @agent_status_waiting '💬')"
+ICON_DONE="$(tmux_opt @agent_status_done '✅')"
+SET_FORMAT="$(tmux_opt @agent_status_set_format 1)"
+RECENT_MARKER="$(tmux_opt @agent_status_recent_marker '•')"
+RECENT_DAYS="$(tmux_opt @agent_status_recent_days 3)"
 # tmux user-option the icon is written to.
-STATUS_VAR="$(tmux_opt @claude_status_var @claude_status)"
+STATUS_VAR="$(tmux_opt @agent_status_var @agent_status)"
 
-# Teardown: `claude-status.tmux stop` — kill the daemon and clear our icons.
-# (The format keeps a harmless empty `#{?@claude_status,...}` until next reload.)
+# Teardown: `agent-status.tmux stop` — kill the daemon and clear our icons.
+# (The format keeps a harmless empty `#{?@agent_status,...}` until next reload.)
 if [ "${1:-}" = "stop" ] || [ "${1:-}" = "uninstall" ]; then
-  pid="$(tmux show-option -gqv @claude_status_pid 2>/dev/null || true)"
+  pid="$(tmux show-option -gqv @agent_status_pid 2>/dev/null || true)"
   [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
-  tmux set-option -gu @claude_status_pid 2>/dev/null || true
+  tmux set-option -gu @agent_status_pid 2>/dev/null || true
   tmux list-panes -a -F '#{pane_id}' 2>/dev/null | while read -r p; do
     tmux set-option -w -u -t "$p" "$STATUS_VAR" 2>/dev/null || true
     # Only wipe the seen/ts memory on a full uninstall. On a plain `stop` (used to
     # restart the daemon) keep them, or every finished window re-shows its ✅.
     if [ "${1:-}" = "uninstall" ]; then
-      tmux set-option -w -u -t "$p" @claude_status_ts 2>/dev/null || true
-      tmux set-option -w -u -t "$p" @claude_status_seen 2>/dev/null || true
+      tmux set-option -w -u -t "$p" @agent_status_ts 2>/dev/null || true
+      tmux set-option -w -u -t "$p" @agent_status_seen 2>/dev/null || true
     fi
   done
   # Remove the seen-stamp hook. NOTE: -u drops ALL after-select-window hooks;
   # fine for this plugin's use, but re-add any of your own after uninstalling.
   tmux set-hook -gu after-select-window 2>/dev/null || true
-  tmux set-option -gu @claude_status_hook_set 2>/dev/null || true
+  tmux set-option -gu @agent_status_hook_set 2>/dev/null || true
   exit 0
 fi
 
@@ -81,19 +81,19 @@ if [ "$SET_FORMAT" = "1" ]; then
   inject_format window-status-current-format
 fi
 
-# Stamp @claude_status_seen the instant a window is viewed, so a finished
+# Stamp @agent_status_seen the instant a window is viewed, so a finished
 # window's done icon clears even on a visit shorter than one poll interval.
 # Appended (-ga) so we don't clobber a user's own after-select-window hook, and
 # guarded by a marker so config reloads don't stack duplicates.
-if [ -z "$(tmux show-option -gqv @claude_status_hook_set 2>/dev/null || true)" ]; then
+if [ -z "$(tmux show-option -gqv @agent_status_hook_set 2>/dev/null || true)" ]; then
   tmux set-hook -ga after-select-window \
-    "run-shell -b \"bash '$CURRENT_DIR/claude-status.tmux' mark-seen '#{window_id}'\""
-  tmux set-option -g @claude_status_hook_set 1
+    "run-shell -b \"bash '$CURRENT_DIR/agent-status.tmux' mark-seen '#{window_id}'\""
+  tmux set-option -g @agent_status_hook_set 1
 fi
 
 # Single-instance guard: store the daemon PID in a server-global tmux option.
 # If a live daemon is already recorded, do nothing.
-EXISTING_PID="$(tmux show-option -gqv @claude_status_pid 2>/dev/null || true)"
+EXISTING_PID="$(tmux show-option -gqv @agent_status_pid 2>/dev/null || true)"
 if [ -n "$EXISTING_PID" ] && kill -0 "$EXISTING_PID" 2>/dev/null; then
   exit 0
 fi
@@ -104,14 +104,14 @@ fi
 SOCKET="${TMUX%%,*}" # $TMUX = <socket>,<pid>,<session>
 
 run_daemon() {
-  CLAUDE_STATUS_SOCKET="$SOCKET" \
-  CLAUDE_STATUS_INTERVAL="$INTERVAL" \
-  CLAUDE_STATUS_VAR="$STATUS_VAR" \
-  CLAUDE_STATUS_ICON_WORKING="$ICON_WORKING" \
-  CLAUDE_STATUS_ICON_WAITING="$ICON_WAITING" \
-  CLAUDE_STATUS_ICON_DONE="$ICON_DONE" \
-  CLAUDE_STATUS_RECENT_MARKER="$RECENT_MARKER" \
-  CLAUDE_STATUS_RECENT_DAYS="$RECENT_DAYS" \
+  AGENT_STATUS_SOCKET="$SOCKET" \
+  AGENT_STATUS_INTERVAL="$INTERVAL" \
+  AGENT_STATUS_VAR="$STATUS_VAR" \
+  AGENT_STATUS_ICON_WORKING="$ICON_WORKING" \
+  AGENT_STATUS_ICON_WAITING="$ICON_WAITING" \
+  AGENT_STATUS_ICON_DONE="$ICON_DONE" \
+  AGENT_STATUS_RECENT_MARKER="$RECENT_MARKER" \
+  AGENT_STATUS_RECENT_DAYS="$RECENT_DAYS" \
   exec bash "$POLLER"
 }
 
@@ -123,4 +123,4 @@ fi
 
 DAEMON_PID=$!
 disown "$DAEMON_PID" 2>/dev/null || true
-tmux set-option -g @claude_status_pid "$DAEMON_PID"
+tmux set-option -g @agent_status_pid "$DAEMON_PID"
