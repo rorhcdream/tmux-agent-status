@@ -75,6 +75,14 @@ win 3: ✅     (active 5 days ago)
 win 4: 🤖 •   (working now)
 ```
 
+## Related: tmux-workspace-tree
+
+[tmux-workspace-tree](https://github.com/rorhcdream/tmux-workspace-tree) is a
+companion fzf popup that lists your tmux windows and workspace tasks. It consumes
+this plugin's `@agent_status` icons and `@agent_status_ts` timestamps to group and
+sort rows (finished → waiting → running). Each plugin works standalone, but they
+are designed to be used together.
+
 ## Requirements
 
 - **bash 4+** and **tmux 3.0+**
