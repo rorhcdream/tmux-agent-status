@@ -95,9 +95,13 @@ run '~/.tmux/plugins/tpm/tpm'
 
 ### Local (no TPM)
 
+```sh
+git clone https://github.com/rorhcdream/tmux-agent-status ~/.tmux/plugins/tmux-agent-status
+```
+
 ```tmux
-# ~/.tmux.conf
-run-shell '~/personal/tmux-agent-status/agent-status.tmux'
+# ~/.tmux.conf — adjust the path if you cloned elsewhere
+run-shell '~/.tmux/plugins/tmux-agent-status/agent-status.tmux'
 ```
 
 Reload tmux (`tmux source-file ~/.tmux.conf`). The daemon starts automatically and
@@ -109,7 +113,7 @@ Remove the `run-shell`/`@plugin` line from `~/.tmux.conf`. To stop it in the run
 server without restarting:
 
 ```sh
-bash ~/personal/tmux-agent-status/agent-status.tmux stop
+bash ~/.tmux/plugins/tmux-agent-status/agent-status.tmux stop
 ```
 
 That kills the daemon and clears all icons. Nothing is written to disk, so there's
