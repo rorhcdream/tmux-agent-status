@@ -1,7 +1,8 @@
 # tmux-agent-status
 
-A tmux plugin that shows each Claude Code agent's status in your tmux window list,
-driven by **Claude Code's own on-disk session state** instead of Claude hooks.
+A tmux plugin that shows each coding agent's status in your tmux window list,
+driven by the agent's **own on-disk session state** instead of hooks. Supports
+**Claude Code** and **Codex**.
 
 ## Why this exists
 
@@ -23,6 +24,16 @@ each Claude PID back to its tmux pane (pane → `pane_pid` → child `claude` pr
 and sets a tmux status option accordingly. Reading ground truth means no stuck icons
 and no false positives on long, quiet generations.
 
+### Codex
+
+Codex has no per-pid status file — it writes an append-only event log per session
+(`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`). The daemon bridges a running
+`codex` process to its log via the file it holds open (`lsof`, then cached per pid so
+the mapping survives the handle closing between turns), and derives status from the
+last turn-boundary event: `task_started` → working, `task_complete` → done,
+`turn_aborted` → cleared. Everything downstream (icons, sticky-done, recency) is shared
+with the Claude path, so a codex pane looks identical.
+
 ## Status mapping
 
 | Claude `status` | tmux icon            |
@@ -30,7 +41,10 @@ and no false positives on long, quiet generations.
 | `busy`, `shell` | 🤖 working           |
 | `waiting`       | 💬 waiting (until you view the window) |
 | `idle`          | ✅ done — **sticky** until you view the window once |
-| no claude proc  | (icon cleared)       |
+| no agent proc   | (icon cleared)       |
+
+(Codex maps its `task_started` / `task_complete` / `turn_aborted` events onto the
+same working / done / cleared states.)
 
 ### Sticky "done" (show until checked)
 
@@ -60,6 +74,14 @@ win 2: ✅ •   (active yesterday)
 win 3: ✅     (active 5 days ago)
 win 4: 🤖 •   (working now)
 ```
+
+## Requirements
+
+- **bash 4+** and **tmux 3.0+**
+- **jq** — parses Claude session JSON and Codex event logs
+- **lsof** — maps a running `codex` process to its session log (not needed for
+  Claude-only setups)
+- standard process tools (`ps`)
 
 ## Install
 
@@ -121,8 +143,9 @@ you'd rather place `#{@agent_status}` in your format yourself.
 - `agent-status.tmux` — entry point tmux runs on load. Launches the daemon detached
   (via `setsid`), single-instanced through the `@agent_status_pid` server option, and
   passes the tmux socket so the daemon targets the right server.
-- `scripts/poller.sh` — the loop: snapshot processes, map each pane's `pane_pid` to a
-  descendant `claude` PID, read its session status, and reconcile the status option
+- `scripts/poller.sh` — the loop: snapshot processes, find every `claude`/`codex`
+  descendant of each pane's `pane_pid`, read each one's status, pick the **most active**
+  (working > waiting > done) when a pane runs several, and reconcile the status option
   (only writing when the value actually changes).
 
 ## Caveats
@@ -130,8 +153,10 @@ you'd rather place `#{@agent_status}` in your format yourself.
 - **Reads an undocumented Claude Code file** (`~/.claude/sessions/<pid>.json`, schema
   observed on v2.1.178). A future Claude release could change the format or status
   values; parsing is defensive but may need updating.
-- Respects `CLAUDE_CONFIG_DIR` for locating the sessions directory.
-- The status option is set window-level, so multiple Claude panes in one window share
-  one icon (last writer wins).
+- Respects `CLAUDE_CONFIG_DIR` for locating the sessions directory (all `~/.claude*`
+  configs are scanned).
+- The status option is window-level: if one window runs several agents (e.g. a claude
+  and a codex side by side) they share a single icon, showing the **most active** one
+  (working > waiting > done).
 - The daemon lives as long as the tmux server; it exits on its own when the server
   goes away.
