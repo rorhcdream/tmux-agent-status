@@ -41,7 +41,11 @@ STATUS_VAR="$(tmux_opt @agent_status_var @agent_status)"
 # (The format keeps a harmless empty `#{?@agent_status,...}` until next reload.)
 if [ "${1:-}" = "stop" ] || [ "${1:-}" = "uninstall" ]; then
   pid="$(tmux show-option -gqv @agent_status_pid 2>/dev/null || true)"
-  [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+  # Only kill if the recorded PID is actually our poller — a stale PID could
+  # have been recycled by an unrelated process.
+  if [ -n "$pid" ] && ps -p "$pid" -o command= 2>/dev/null | grep -q 'poller\.sh'; then
+    kill "$pid" 2>/dev/null || true
+  fi
   tmux set-option -gu @agent_status_pid 2>/dev/null || true
   tmux list-panes -a -F '#{pane_id}' 2>/dev/null | while read -r p; do
     tmux set-option -w -u -t "$p" "$STATUS_VAR" 2>/dev/null || true
@@ -52,9 +56,16 @@ if [ "${1:-}" = "stop" ] || [ "${1:-}" = "uninstall" ]; then
       tmux set-option -w -u -t "$p" @agent_status_seen 2>/dev/null || true
     fi
   done
-  # Remove the seen-stamp hook. NOTE: -u drops ALL after-select-window hooks;
-  # fine for this plugin's use, but re-add any of your own after uninstalling.
-  tmux set-hook -gu after-select-window 2>/dev/null || true
+  # Remove ONLY our own seen-stamp hook(s), matched by this plugin's path, so we
+  # never clobber unrelated after-select-window hooks. Unset highest index first
+  # (tmux leaves the other indices untouched).
+  tmux show-hooks -g 2>/dev/null \
+    | grep -F "$CURRENT_DIR/agent-status.tmux' mark-seen" \
+    | sed -n 's/^after-select-window\[\([0-9]\{1,\}\)\].*/\1/p' \
+    | sort -rn \
+    | while read -r _i; do
+        tmux set-hook -gu "after-select-window[$_i]" 2>/dev/null || true
+      done
   tmux set-option -gu @agent_status_hook_set 2>/dev/null || true
   exit 0
 fi
@@ -114,6 +125,13 @@ run_daemon() {
   AGENT_STATUS_RECENT_DAYS="$RECENT_DAYS" \
   exec bash "$POLLER"
 }
+
+# Export everything run_daemon references so the detached child inherits it. The
+# `setsid bash -c` path starts a FRESH shell that only receives the serialized
+# function body — without these exports POLLER/SOCKET/… would be empty there and
+# the daemon would exec an empty path.
+export POLLER SOCKET INTERVAL STATUS_VAR \
+  ICON_WORKING ICON_WAITING ICON_DONE RECENT_MARKER RECENT_DAYS
 
 if command -v setsid >/dev/null 2>&1; then
   setsid bash -c "$(declare -f run_daemon); run_daemon" >/dev/null 2>&1 &

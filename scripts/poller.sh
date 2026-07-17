@@ -34,6 +34,11 @@ ICON_DONE="${AGENT_STATUS_ICON_DONE:-✅}"
 RECENT_MARKER="${AGENT_STATUS_RECENT_MARKER:-•}"
 RECENT_DAYS="${AGENT_STATUS_RECENT_DAYS:-3}"
 
+# Guard the numeric settings so a bad tmux-option value can't break `sleep`
+# (INTERVAL, integer or decimal) or integer arithmetic (RECENT_DAYS).
+case "$INTERVAL" in ''|*[!0-9.]*|*.*.*) INTERVAL=2 ;; esac
+case "$RECENT_DAYS" in ''|*[!0-9]*) RECENT_DAYS=3 ;; esac
+
 # Claude config dirs to scan for sessions/<pid>.json (space-separated). When
 # Claude runs under more than one config dir (via CLAUDE_CONFIG_DIR), session
 # files are split across them, so this global daemon watches them ALL. We
