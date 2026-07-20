@@ -28,11 +28,12 @@ and no false positives on long, quiet generations.
 
 Codex has no per-pid status file — it writes an append-only event log per session
 (`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`). The daemon bridges a running
-`codex` process to its log via the file it holds open (`lsof`, then cached per pid so
-the mapping survives the handle closing between turns), and derives status from the
-last turn-boundary event: `task_started` → working, `task_complete` → done,
-`turn_aborted` → cleared. Everything downstream (icons, sticky-done, recency) is shared
-with the Claude path, so a codex pane looks identical.
+`codex` process to the freshest rollout file it holds open with `lsof` (a resumed
+process can retain several), then caches that mapping so it survives the handle
+closing between turns. It derives status from the last turn-boundary event:
+`task_started` → working, `task_complete` → done, `turn_aborted` → cleared.
+Everything downstream (icons, sticky-done, recency) is shared with the Claude path,
+so a codex pane looks identical.
 
 ## Status mapping
 
@@ -159,6 +160,12 @@ you'd rather place `#{@agent_status}` in your format yourself.
   descendant of each pane's `pane_pid`, read each one's status, pick the **most active**
   (working > waiting > done) when a pane runs several, and reconcile the status option
   (only writing when the value actually changes).
+
+## Testing
+
+```sh
+bash tests/poller_test.sh
+```
 
 ## Caveats
 

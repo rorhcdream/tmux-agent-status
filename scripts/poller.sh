@@ -136,32 +136,66 @@ status_for_pid() {
 # --- Codex support -----------------------------------------------------------
 # Codex stores each session as an append-only event log at
 # ~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl, named by timestamp and
-# UUID (no pid). We bridge a running codex pid to its rollout via the file it
-# holds open (lsof), then cache pid->file for the process's lifetime so the
+# UUID (no pid). We bridge a running codex pid to its rollout via the files it
+# holds open (lsof), choosing the freshest one because resumed sessions can leave
+# several rollout files open in the same process. We cache pid->file so the
 # mapping survives the handle being closed between turns (keeps the sticky done
 # icon working). Status is derived from the last turn-boundary event.
 declare -A CODEX_FILE_OF   # codex pid -> rollout jsonl path (cached)
 
 codex_file_for_pid() {
-  local pid="$1" f
-  f="${CODEX_FILE_OF[$pid]:-}"
-  [ -n "$f" ] && [ -f "$f" ] && { printf '%s' "$f"; return 0; }
-  # Locate the rollout .jsonl the codex process currently holds open.
-  f="$(lsof -p "$pid" -Fn 2>/dev/null | sed -n 's/^n//p' \
-        | grep -m1 -E '/sessions/.*/rollout-.*\.jsonl$')"
-  [ -n "$f" ] && [ -f "$f" ] && { CODEX_FILE_OF["$pid"]="$f"; printf '%s' "$f"; return 0; }
+  # codex_file_for_pid <pid> <output-variable>
+  local pid="$1" output_var="$2"
+  local cached="${CODEX_FILE_OF[$pid]:-}" candidate mtime
+  local freshest="" freshest_mtime=0
+
+  # A resumed Codex process may retain several rollout handles. lsof order is
+  # not a recency guarantee, so inspect every matching file instead of taking
+  # the first one. Re-check on every poll so a newly resumed session replaces
+  # the cached path as soon as its log becomes fresher.
+  while IFS= read -r candidate; do
+    [ -f "$candidate" ] || continue
+    mtime="$(file_mtime "$candidate")"
+    case "$mtime" in ''|*[!0-9]*) mtime=0 ;; esac
+    if [ "$mtime" -gt "$freshest_mtime" ] \
+      || { [ "$mtime" -eq "$freshest_mtime" ] && [[ "$candidate" > "$freshest" ]]; }; then
+      freshest="$candidate"
+      freshest_mtime="$mtime"
+    fi
+  done < <(lsof -p "$pid" -Fn 2>/dev/null | sed -n 's/^n//p' \
+        | grep -E '/sessions/.*/rollout-.*\.jsonl$')
+
+  if [ -n "$freshest" ]; then
+    CODEX_FILE_OF["$pid"]="$freshest"
+    printf -v "$output_var" '%s' "$freshest"
+    return 0
+  fi
+  # Codex may close the rollout briefly between turns. Preserve the most recent
+  # valid mapping until the process exits (reconcile clears it at that point).
+  if [ -n "$cached" ] && [ -f "$cached" ]; then
+    printf -v "$output_var" '%s' "$cached"
+    return 0
+  fi
+  printf -v "$output_var" ''
   return 1
 }
 
-# Echoes "<status>\t<ts_ms>" for a codex pid, derived from the rollout tail:
+# Sets caller-named status/timestamp variables for a codex pid, derived from the
+# rollout tail:
 #   task_started (no later task_complete) -> busy;  task_complete -> idle;
 #   turn_aborted -> cleared. ts comes from the boundary event's ISO timestamp.
 status_for_codex_pid() {
-  local pid="$1" f out ev tsms st=""
-  f="$(codex_file_for_pid "$pid")" || { printf '\t0'; return; }
+  # status_for_codex_pid <pid> <status-variable> <timestamp-variable>
+  local pid="$1" status_var="$2" timestamp_var="$3"
+  local codex_file="" out ev tsms st=""
+  if ! codex_file_for_pid "$pid" codex_file; then
+    printf -v "$status_var" ''
+    printf -v "$timestamp_var" '0'
+    return
+  fi
   # One jq pass over the tail: take the LAST turn-boundary event, emit
   # "<type>\t<epoch_ms>" (ms parsed from its ISO8601 .timestamp).
-  out="$(tail -n 80 "$f" 2>/dev/null | jq -rs '
+  out="$(tail -n 80 "$codex_file" 2>/dev/null | jq -rs '
     ([ .[]
        | {t: (.payload.type // .type // ""), ts: (.timestamp // "")}
        | select(.t=="task_started" or .t=="task_complete" or .t=="turn_aborted") ]
@@ -170,7 +204,11 @@ status_for_codex_pid() {
       else $e.t + "\t"
         + ((try (($e.ts | sub("\\.[0-9]+";"") | fromdateiso8601) * 1000) catch 0) | tostring)
       end' 2>/dev/null)"
-  [ -n "$out" ] || { printf '\t0'; return; }
+  if [ -z "$out" ]; then
+    printf -v "$status_var" ''
+    printf -v "$timestamp_var" '0'
+    return
+  fi
   ev="${out%%$'\t'*}"
   tsms="${out#*$'\t'}"
   case "$ev" in
@@ -178,8 +216,9 @@ status_for_codex_pid() {
     task_complete) st="idle" ;;
     *)             st="" ;;
   esac
-  case "$tsms" in ''|0|null) tsms="$(file_mtime "$f")000"; [ "$tsms" = "000" ] && tsms=0 ;; esac
-  printf '%s\t%s' "$st" "$tsms"
+  case "$tsms" in ''|0|null) tsms="$(file_mtime "$codex_file")000"; [ "$tsms" = "000" ] && tsms=0 ;; esac
+  printf -v "$status_var" '%s' "$st"
+  printf -v "$timestamp_var" '%s' "$tsms"
 }
 
 set_pane_status() {
@@ -223,7 +262,10 @@ reconcile() {
     while IFS=$'\t' read -r apid akind; do
       [ -z "${apid:-}" ] && continue
       if [ "$akind" = "codex" ]; then
-        IFS=$'\t' read -r ast ats < <(status_for_codex_pid "$apid")
+        # Call directly (not through process substitution) so a refreshed
+        # pid->rollout cache remains in this shell for later polls.
+        ast=""; ats=0
+        status_for_codex_pid "$apid" ast ats
       else
         IFS=$'\t' read -r ast ats < <(status_for_pid "$apid")
       fi
@@ -293,7 +335,9 @@ reconcile() {
 }
 
 # One-shot mode: reconcile once and exit (for testing / manual refresh).
-if [ -n "${AGENT_STATUS_ONESHOT:-}" ]; then
+if [ -n "${AGENT_STATUS_SOURCE_ONLY:-}" ]; then
+  return 0 2>/dev/null || exit 0
+elif [ -n "${AGENT_STATUS_ONESHOT:-}" ]; then
   reconcile
   exit 0
 fi
