@@ -12,6 +12,11 @@ POLLER="$CURRENT_DIR/scripts/poller.sh"
 # with the current time in ms, so the poller knows a completion has been seen.
 # Instant on every visit — no dependence on catching #{window_active} at a tick.
 if [ "${1:-}" = "mark-seen" ]; then
+  # A full-screen popup covers the pane even though tmux still reports its
+  # window active. Do not acknowledge a completion the user cannot see.
+  popup_count="$(tmux show-option -gqv @agent_status_popup_count 2>/dev/null || true)"
+  case "$popup_count" in ''|*[!0-9]*) popup_count=0 ;; esac
+  [ "$popup_count" -gt 0 ] && exit 0
   # Ceil to end-of-second (+999): macOS `date` has no ms, but statusUpdatedAt
   # does — a floored stamp would be < a completion ts in the same second, so a
   # quick visit right as the agent finishes wouldn't clear the done icon.
@@ -27,7 +32,7 @@ tmux_opt() {
 }
 
 # --- User-tunable options (set with `set -g @... ...` in tmux.conf) ---
-INTERVAL="$(tmux_opt @agent_status_interval 2)"
+INTERVAL="$(tmux_opt @agent_status_interval 0.5)"
 ICON_WORKING="$(tmux_opt @agent_status_working '🤖')"
 ICON_WAITING="$(tmux_opt @agent_status_waiting '💬')"
 ICON_DONE="$(tmux_opt @agent_status_done '✅')"
@@ -45,6 +50,18 @@ if [ "${1:-}" = "stop" ] || [ "${1:-}" = "uninstall" ]; then
   # have been recycled by an unrelated process.
   if [ -n "$pid" ] && ps -p "$pid" -o command= 2>/dev/null | grep -q 'poller\.sh'; then
     kill "$pid" 2>/dev/null || true
+    # Do not forget the PID while the old daemon can still write status. A fast
+    # stop/start would otherwise launch a second poller and make icons flicker
+    # as the two loops overwrite each other. TERM should interrupt its sleep;
+    # allow a few seconds for a clean exit without escalating to SIGKILL.
+    for _wait in {1..30}; do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      printf 'agent-status: poller %s did not stop; refusing to start a duplicate\n' "$pid" >&2
+      exit 1
+    fi
   fi
   tmux set-option -gu @agent_status_pid 2>/dev/null || true
   tmux list-panes -a -F '#{pane_id}' 2>/dev/null | while read -r p; do
@@ -59,13 +76,15 @@ if [ "${1:-}" = "stop" ] || [ "${1:-}" = "uninstall" ]; then
   # Remove ONLY our own seen-stamp hook(s), matched by this plugin's path, so we
   # never clobber unrelated after-select-window hooks. Unset highest index first
   # (tmux leaves the other indices untouched).
+  # No matching hook is a valid state (for example, after moving the plugin),
+  # so an empty grep result must not abort teardown under `set -o pipefail`.
   tmux show-hooks -g 2>/dev/null \
     | grep -F "$CURRENT_DIR/agent-status.tmux' mark-seen" \
     | sed -n 's/^after-select-window\[\([0-9]\{1,\}\)\].*/\1/p' \
     | sort -rn \
     | while read -r _i; do
         tmux set-hook -gu "after-select-window[$_i]" 2>/dev/null || true
-      done
+      done || true
   tmux set-option -gu @agent_status_hook_set 2>/dev/null || true
   exit 0
 fi

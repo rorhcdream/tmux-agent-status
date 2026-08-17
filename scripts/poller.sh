@@ -9,7 +9,7 @@
 #
 # Status mapping:
 #   busy | shell  -> working icon
-#   waiting       -> waiting icon (shown until you view the window)
+#   waiting       -> waiting icon (shown until the agent leaves waiting state)
 #   idle          -> done icon, STICKY: shown until you view the window once;
 #                    stays cleared until the next completion
 #   (no claude)   -> cleared
@@ -26,7 +26,7 @@
 set -uo pipefail
 
 SOCKET="${AGENT_STATUS_SOCKET:-}"
-INTERVAL="${AGENT_STATUS_INTERVAL:-2}"
+INTERVAL="${AGENT_STATUS_INTERVAL:-0.5}"
 STATUS_VAR="${AGENT_STATUS_VAR:-@agent_status}"
 ICON_WORKING="${AGENT_STATUS_ICON_WORKING:-🤖}"
 ICON_WAITING="${AGENT_STATUS_ICON_WAITING:-💬}"
@@ -35,9 +35,25 @@ RECENT_MARKER="${AGENT_STATUS_RECENT_MARKER:-•}"
 RECENT_DAYS="${AGENT_STATUS_RECENT_DAYS:-3}"
 
 # Guard the numeric settings so a bad tmux-option value can't break `sleep`
-# (INTERVAL, integer or decimal) or integer arithmetic (RECENT_DAYS).
-case "$INTERVAL" in ''|*[!0-9.]*|*.*.*) INTERVAL=2 ;; esac
+# (INTERVAL, positive integer or decimal) or integer arithmetic (RECENT_DAYS).
+case "$INTERVAL" in
+  ''|*[!0-9.]*|*.*.*|.*|*.) INTERVAL=0.5 ;;
+esac
 case "$RECENT_DAYS" in ''|*[!0-9]*) RECENT_DAYS=3 ;; esac
+
+# Convert the cadence once so refresh time can be subtracted from each sleep.
+# Sub-second timing needs EPOCHREALTIME, which is Bash 5+; the rest of this
+# script only needs Bash 4 (associative arrays). On Bash 4 the variable is unset
+# and every caller falls back to a plain sleep of the full interval.
+_interval_whole="${INTERVAL%%.*}"
+if [ "$INTERVAL" = "$_interval_whole" ]; then
+  _interval_fraction=000000
+else
+  _interval_fraction="${INTERVAL#*.}000000"
+  _interval_fraction="${_interval_fraction:0:6}"
+fi
+INTERVAL_US=$(( 10#$_interval_whole * 1000000 + 10#$_interval_fraction ))
+[ "$INTERVAL_US" -gt 0 ] || { INTERVAL=0.5; INTERVAL_US=500000; }
 
 # Claude config dirs to scan for sessions/<pid>.json (space-separated). When
 # Claude runs under more than one config dir (via CLAUDE_CONFIG_DIR), session
@@ -74,14 +90,23 @@ file_mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null; }
 
 declare -A PPID_OF       # pid -> ppid
 declare -A COMM_OF       # pid -> basename(comm)
+declare -A CHILDREN_OF   # ppid -> space-separated child pids
+HAS_CODEX_PROCESS=0
+PROCESS_SNAPSHOT_AT_US=0
+CODEX_SNAPSHOT_AT_US=0
+PANE_PROCESS_FINGERPRINT=""
+PROCESS_SNAPSHOT_TTL_US=5000000 # safety rescan; pane command changes are immediate
+CODEX_SNAPSHOT_TTL_US=2000000   # catches resumed pre-existing rollouts
 
 snapshot_processes() {
-  PPID_OF=(); COMM_OF=()
+  PPID_OF=(); COMM_OF=(); CHILDREN_OF=(); HAS_CODEX_PROCESS=0
   local pid ppid comm
   while read -r pid ppid comm; do
     [ -z "${pid:-}" ] && continue
     PPID_OF["$pid"]="$ppid"
     COMM_OF["$pid"]="${comm##*/}"
+    CHILDREN_OF["$ppid"]+="${CHILDREN_OF[$ppid]:+ }$pid"
+    [ "${comm##*/}" = codex ] && HAS_CODEX_PROCESS=1
   done < <(ps -Ao pid=,ppid=,comm= 2>/dev/null)
 }
 
@@ -91,7 +116,12 @@ snapshot_processes() {
 # side); the caller aggregates their statuses. We don't descend into an agent's
 # own subtree (an agent's children aren't separate sessions).
 find_agent_pids() {
-  local root="$1" depth=0 max=6 found=1
+  # find_agent_pids <root-pid> <output-variable>
+  local root="$1" output_var="$2" depth=0 max=6 found=1 result=""
+  if [ -z "$root" ]; then
+    printf -v "$output_var" ''
+    return 1
+  fi
   local -a frontier=("$root") next=()
   while [ "${#frontier[@]}" -gt 0 ] && [ "$depth" -lt "$max" ]; do
     next=()
@@ -99,114 +129,230 @@ find_agent_pids() {
     for p in "${frontier[@]}"; do
       comm="${COMM_OF[$p]:-}"
       if [ "$comm" = "claude" ] || [ "$comm" = "codex" ]; then
-        printf '%s\t%s\n' "$p" "$comm"; found=0
+        result+="${result:+$'\n'}$p"$'\t'"$comm"; found=0
         continue
       fi
-      for child in "${!PPID_OF[@]}"; do
-        [ "${PPID_OF[$child]}" = "$p" ] && next+=("$child")
+      for child in ${CHILDREN_OF[$p]:-}; do
+        next+=("$child")
       done
     done
     frontier=("${next[@]+"${next[@]}"}")
     depth=$((depth + 1))
   done
+  printf -v "$output_var" '%s' "$result"
   return "$found"
 }
 
-# Echoes "<status>\t<ts_ms>" for a Claude pid; ts falls back to file mtime.
+# Returns status and ts_ms for a Claude pid; ts falls back to file mtime.
 # Scans every config dir; if the same pid.json exists in several (pid reuse
 # across configs), the freshest mtime wins — the stale one is a dead session.
+declare -A CLAUDE_FILE_OF     # claude pid -> selected session file
+declare -A CLAUDE_CONTENT_OF  # session file -> exact content at last parse
+declare -A CLAUDE_STATUS_OF   # session file -> last parsed status
+declare -A CLAUDE_TS_OF       # session file -> last parsed timestamp
+
 status_for_pid() {
-  local pid="$1"
+  # status_for_pid <pid> <status-variable> <timestamp-variable>
+  local pid="$1" status_var="$2" timestamp_var="$3"
   local d cand f="" best=0 m
-  for d in $CONFIG_DIRS; do
-    cand="$d/sessions/$pid.json"
-    [ -f "$cand" ] || continue
-    m="$(file_mtime "$cand")"
-    [ "${m:-0}" -gt "$best" ] 2>/dev/null && { best="$m"; f="$cand"; }
-  done
-  local out s ts
-  [ -n "$f" ] || { printf '\t0'; return; }
-  out="$(jq -r '[(.status // ""), ((.statusUpdatedAt // .updatedAt) // 0)] | @tsv' "$f" 2>/dev/null)"
+  f="${CLAUDE_FILE_OF[$pid]:-}"
+  if [ ! -f "$f" ]; then
+    f=""
+    for d in $CONFIG_DIRS; do
+      cand="$d/sessions/$pid.json"
+      [ -f "$cand" ] || continue
+      m="$(file_mtime "$cand")"
+      [ "${m:-0}" -gt "$best" ] 2>/dev/null && { best="$m"; f="$cand"; }
+    done
+    if [ -n "$f" ]; then
+      CLAUDE_FILE_OF["$pid"]="$f"
+    else
+      unset 'CLAUDE_FILE_OF[$pid]'
+      printf -v "$status_var" ''
+      printf -v "$timestamp_var" '0'
+      return
+    fi
+  fi
+
+  local content out s ts
+  content="$(< "$f")"
+  if [ "${CLAUDE_CONTENT_OF[$f]+set}" = set ] \
+    && [ "${CLAUDE_CONTENT_OF[$f]}" = "$content" ]; then
+    printf -v "$status_var" '%s' "${CLAUDE_STATUS_OF[$f]:-}"
+    printf -v "$timestamp_var" '%s' "${CLAUDE_TS_OF[$f]:-0}"
+    return
+  fi
+
+  out="$(jq -r '[(.status // ""), ((.statusUpdatedAt // .updatedAt) // 0)] | @tsv' <<< "$content" 2>/dev/null)"
   s="${out%%$'\t'*}"
   ts="${out#*$'\t'}"
   case "$ts" in ''|0|null) ts="$(file_mtime "$f")000"; [ "$ts" = "000" ] && ts=0 ;; esac
-  printf '%s\t%s' "$s" "$ts"
+  CLAUDE_CONTENT_OF["$f"]="$content"
+  CLAUDE_STATUS_OF["$f"]="$s"
+  CLAUDE_TS_OF["$f"]="$ts"
+  printf -v "$status_var" '%s' "$s"
+  printf -v "$timestamp_var" '%s' "$ts"
 }
 
 # --- Codex support -----------------------------------------------------------
 # Codex stores each session as an append-only event log at
 # ~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl, named by timestamp and
-# UUID (no pid). We bridge a running codex pid to its rollout via the files it
-# holds open (lsof), choosing the freshest one because resumed sessions can leave
-# several rollout files open in the same process. We cache pid->file so the
-# mapping survives the handle being closed between turns (keeps the sticky done
-# icon working). Status is derived from the last turn-boundary event.
-declare -A CODEX_FILE_OF   # codex pid -> rollout jsonl path (cached)
+# UUID (no pid). We bridge a running codex pid to every rollout file it holds
+# open (lsof). A resumed or multi-agent process can keep several live rollouts,
+# so their states are aggregated with working > done instead of allowing the
+# most recently written completion to hide another running turn. We cache the
+# set per pid so status survives handles closing briefly between turns.
+declare -A CODEX_FILES_OF   # codex pid -> newline-separated rollout paths
+declare -A CODEX_FILE_PID_OF # rollout path -> owning codex pid
+declare -A CODEX_KNOWN_OF    # rollout path -> 1 once its history has been seeded
+declare -A CODEX_STATUS_OF   # rollout path -> last derived status
+declare -A CODEX_TS_OF       # rollout path -> last boundary timestamp
+declare -A CODEX_SIZE_OF     # rollout path -> size after last parse
+declare -A CODEX_OPEN_FILES_OF # codex pid -> rollouts open this poll
+declare -A CODEX_SIZE_SNAPSHOT_OF # rollout path -> size in this poll
 
-codex_file_for_pid() {
-  # codex_file_for_pid <pid> <output-variable>
+if stat -f %z "$0" >/dev/null 2>&1; then
+  STAT_SIZE_STYLE=bsd
+else
+  STAT_SIZE_STYLE=gnu
+fi
+
+# Snapshot open rollout handles for every Codex process with one lsof call.
+# Running lsof separately for each pane was the largest avoidable polling cost.
+snapshot_codex_files() {
+  CODEX_OPEN_FILES_OF=()
+  [ "$HAS_CODEX_PROCESS" = 1 ] || return
+  local line pid="" candidate
+  while IFS= read -r line; do
+    case "$line" in
+      p*) pid="${line#p}" ;;
+      n*/sessions/*/rollout-*.jsonl)
+        candidate="${line#n}"
+        [ -n "$pid" ] && [ -f "$candidate" ] || continue
+        CODEX_OPEN_FILES_OF["$pid"]+="${CODEX_OPEN_FILES_OF[$pid]:+$'\n'}$candidate"
+        ;;
+    esac
+  done < <(lsof -a -c codex -Fn 2>/dev/null)
+}
+
+# Query all known rollout sizes with one stat process. A separate stat per file
+# was more expensive than the actual cached status computation.
+snapshot_codex_sizes() {
+  CODEX_SIZE_SNAPSHOT_OF=()
+  local -A seen=()
+  local -a paths=()
+  local files candidate line path size
+  # Guarded expansion: Bash before 4.4 treats an empty array as unbound under
+  # `set -u`, and both maps are empty whenever no Codex process is running.
+  for files in "${CODEX_OPEN_FILES_OF[@]+"${CODEX_OPEN_FILES_OF[@]}"}" \
+    "${CODEX_FILES_OF[@]+"${CODEX_FILES_OF[@]}"}"; do
+    while IFS= read -r candidate; do
+      [ -f "$candidate" ] || continue
+      [ -z "${seen[$candidate]:-}" ] || continue
+      seen["$candidate"]=1
+      paths+=("$candidate")
+    done <<< "$files"
+  done
+  [ "${#paths[@]}" -gt 0 ] || return
+
+  if [ "$STAT_SIZE_STYLE" = bsd ]; then
+    while IFS=$'\t' read -r path size; do
+      CODEX_SIZE_SNAPSHOT_OF["$path"]="$size"
+    done < <(stat -f $'%N\t%z' "${paths[@]}" 2>/dev/null)
+  else
+    while IFS=$'\t' read -r path size; do
+      CODEX_SIZE_SNAPSHOT_OF["$path"]="$size"
+    done < <(stat -c $'%n\t%s' "${paths[@]}" 2>/dev/null)
+  fi
+}
+
+codex_files_for_pid() {
+  # codex_files_for_pid <pid> <output-variable>
   local pid="$1" output_var="$2"
-  local cached="${CODEX_FILE_OF[$pid]:-}" candidate mtime
-  local freshest="" freshest_mtime=0
+  local cached="${CODEX_FILES_OF[$pid]:-}" candidate
+  local files="${CODEX_OPEN_FILES_OF[$pid]:-}" valid_cached=""
 
-  # A resumed Codex process may retain several rollout handles. lsof order is
-  # not a recency guarantee, so inspect every matching file instead of taking
-  # the first one. Re-check on every poll so a newly resumed session replaces
-  # the cached path as soon as its log becomes fresher.
+  # Use the consolidated per-poll snapshot so newly opened/resumed rollouts
+  # join the aggregate without spawning lsof once per Codex process.
   while IFS= read -r candidate; do
     [ -f "$candidate" ] || continue
-    mtime="$(file_mtime "$candidate")"
-    case "$mtime" in ''|*[!0-9]*) mtime=0 ;; esac
-    if [ "$mtime" -gt "$freshest_mtime" ] \
-      || { [ "$mtime" -eq "$freshest_mtime" ] && [[ "$candidate" > "$freshest" ]]; }; then
-      freshest="$candidate"
-      freshest_mtime="$mtime"
-    fi
-  done < <(lsof -p "$pid" -Fn 2>/dev/null | sed -n 's/^n//p' \
-        | grep -E '/sessions/.*/rollout-.*\.jsonl$')
+    CODEX_FILE_PID_OF["$candidate"]="$pid"
+  done <<< "$files"
 
-  if [ -n "$freshest" ]; then
-    CODEX_FILE_OF["$pid"]="$freshest"
-    printf -v "$output_var" '%s' "$freshest"
+  if [ -n "$files" ]; then
+    CODEX_FILES_OF["$pid"]="$files"
+    printf -v "$output_var" '%s' "$files"
     return 0
   fi
-  # Codex may close the rollout briefly between turns. Preserve the most recent
-  # valid mapping until the process exits (reconcile clears it at that point).
-  if [ -n "$cached" ] && [ -f "$cached" ]; then
-    printf -v "$output_var" '%s' "$cached"
+
+  # Codex may close rollout handles briefly between turns. Preserve all cached
+  # paths that still exist until the process exits (reconcile clears the set).
+  while IFS= read -r candidate; do
+    [ -f "$candidate" ] || continue
+    valid_cached+="${valid_cached:+$'\n'}$candidate"
+  done <<< "$cached"
+  if [ -n "$valid_cached" ]; then
+    CODEX_FILES_OF["$pid"]="$valid_cached"
+    printf -v "$output_var" '%s' "$valid_cached"
     return 0
   fi
+  unset 'CODEX_FILES_OF[$pid]'
   printf -v "$output_var" ''
   return 1
 }
 
-# Sets caller-named status/timestamp variables for a codex pid, derived from the
-# rollout tail:
+# A rollout's status is derived from its last turn-boundary event:
 #   task_started (no later task_complete) -> busy;  task_complete -> idle;
 #   turn_aborted -> cleared. ts comes from the boundary event's ISO timestamp.
-status_for_codex_pid() {
-  # status_for_codex_pid <pid> <status-variable> <timestamp-variable>
-  local pid="$1" status_var="$2" timestamp_var="$3"
-  local codex_file="" out ev tsms st=""
-  if ! codex_file_for_pid "$pid" codex_file; then
-    printf -v "$status_var" ''
-    printf -v "$timestamp_var" '0'
+status_for_codex_file() {
+  # status_for_codex_file <file> <status-variable> <timestamp-variable>
+  local codex_file="$1" status_var="$2" timestamp_var="$3"
+  local out ev tsms st="" seeded="${CODEX_KNOWN_OF[$codex_file]:-}"
+  local size="${CODEX_SIZE_SNAPSHOT_OF[$codex_file]:-}"
+  if [ -z "$size" ]; then
+    size="$(stat -f %z "$codex_file" 2>/dev/null || stat -c %s "$codex_file" 2>/dev/null)"
+  fi
+  case "$size" in ''|*[!0-9]*) size=0 ;; esac
+
+  # Rollouts are append-only. If the byte size is unchanged, no boundary can
+  # have changed, so avoid spawning tail+jq and return the cached state.
+  if [ -n "$seeded" ] && [ "${CODEX_SIZE_OF[$codex_file]:--1}" = "$size" ]; then
+    printf -v "$status_var" '%s' "${CODEX_STATUS_OF[$codex_file]:-}"
+    printf -v "$timestamp_var" '%s' "${CODEX_TS_OF[$codex_file]:-0}"
     return
   fi
-  # One jq pass over the tail: take the LAST turn-boundary event, emit
-  # "<type>\t<epoch_ms>" (ms parsed from its ISO8601 .timestamp).
-  out="$(tail -n 80 "$codex_file" 2>/dev/null | jq -rs '
-    ([ .[]
-       | {t: (.payload.type // .type // ""), ts: (.timestamp // "")}
-       | select(.t=="task_started" or .t=="task_complete" or .t=="turn_aborted") ]
-     | last) as $e
-    | if $e == null then empty
-      else $e.t + "\t"
-        + ((try (($e.ts | sub("\\.[0-9]+";"") | fromdateiso8601) * 1000) catch 0) | tostring)
-      end' 2>/dev/null)"
+
+  # Seed a newly discovered rollout from its full history once. Later polls only
+  # inspect a bounded tail; if a long running turn pushes task_started beyond
+  # that tail, retain the cached boundary instead of incorrectly going blank.
+  if [ -z "$seeded" ]; then
+    out="$(jq -Rrn '
+      ([ inputs
+         | fromjson?
+         | {t: (.payload.type // .type // ""), ts: (.timestamp // "")}
+         | select(.t=="task_started" or .t=="task_complete" or .t=="turn_aborted") ]
+       | last) as $e
+      | if $e == null then empty
+        else $e.t + "\t"
+          + ((try (($e.ts | sub("\\.[0-9]+";"") | fromdateiso8601) * 1000) catch 0) | tostring)
+        end' "$codex_file" 2>/dev/null)"
+  else
+    out="$(tail -n 400 "$codex_file" 2>/dev/null | jq -Rrn '
+      ([ inputs
+         | fromjson?
+         | {t: (.payload.type // .type // ""), ts: (.timestamp // "")}
+         | select(.t=="task_started" or .t=="task_complete" or .t=="turn_aborted") ]
+       | last) as $e
+      | if $e == null then empty
+        else $e.t + "\t"
+          + ((try (($e.ts | sub("\\.[0-9]+";"") | fromdateiso8601) * 1000) catch 0) | tostring)
+        end' 2>/dev/null)"
+  fi
   if [ -z "$out" ]; then
-    printf -v "$status_var" ''
-    printf -v "$timestamp_var" '0'
+    CODEX_KNOWN_OF["$codex_file"]=1
+    CODEX_SIZE_OF["$codex_file"]="$size"
+    printf -v "$status_var" '%s' "${CODEX_STATUS_OF[$codex_file]:-}"
+    printf -v "$timestamp_var" '%s' "${CODEX_TS_OF[$codex_file]:-0}"
     return
   fi
   ev="${out%%$'\t'*}"
@@ -217,48 +363,178 @@ status_for_codex_pid() {
     *)             st="" ;;
   esac
   case "$tsms" in ''|0|null) tsms="$(file_mtime "$codex_file")000"; [ "$tsms" = "000" ] && tsms=0 ;; esac
+  CODEX_KNOWN_OF["$codex_file"]=1
+  CODEX_STATUS_OF["$codex_file"]="$st"
+  CODEX_TS_OF["$codex_file"]="$tsms"
+  CODEX_SIZE_OF["$codex_file"]="$size"
   printf -v "$status_var" '%s' "$st"
   printf -v "$timestamp_var" '%s' "$tsms"
 }
 
-set_pane_status() {
-  # set_pane_status <pane_id> <current> <desired>
-  local pane="$1" current="$2" desired="$3"
+# Aggregate every rollout held by a codex pid. A working rollout wins over an
+# idle one; timestamps break ties within the same state rank.
+status_for_codex_pid() {
+  # status_for_codex_pid <pid> <status-variable> <timestamp-variable>
+  local pid="$1" status_var="$2" timestamp_var="$3"
+  local codex_files="" codex_file file_st file_ts rank best=0
+  local best_st="" best_ts=0
+  if ! codex_files_for_pid "$pid" codex_files; then
+    printf -v "$status_var" ''
+    printf -v "$timestamp_var" '0'
+    return
+  fi
+
+  while IFS= read -r codex_file; do
+    [ -n "$codex_file" ] || continue
+    file_st=""; file_ts=0
+    status_for_codex_file "$codex_file" file_st file_ts
+    case "$file_st" in
+      busy|shell) rank=3 ;;
+      idle)       rank=1 ;;
+      *)          rank=0 ;;
+    esac
+    if [ "$rank" -gt "$best" ] \
+      || { [ "$rank" -eq "$best" ] && [ "${file_ts:-0}" -gt "${best_ts:-0}" ] 2>/dev/null; }; then
+      best="$rank"; best_st="$file_st"; best_ts="${file_ts:-0}"
+    fi
+  done <<< "$codex_files"
+
+  printf -v "$status_var" '%s' "$best_st"
+  printf -v "$timestamp_var" '%s' "$best_ts"
+}
+
+base_icon_for_status() {
+  # base_icon_for_status <status> <viewing> <seen-ts> <status-ts> <output-var>
+  local status="$1" viewing="$2" seen="$3" status_ts="$4" output_var="$5"
+  local result_icon=""
+  case "$status" in
+    busy|shell) result_icon="$ICON_WORKING" ;;
+    waiting)    result_icon="$ICON_WAITING" ;;
+    idle)
+      if [ "$viewing" != "1" ] && [ "$seen" -lt "$status_ts" ] 2>/dev/null; then
+        result_icon="$ICON_DONE"
+      fi
+      ;;
+  esac
+  printf -v "$output_var" '%s' "$result_icon"
+}
+
+result_is_visible() {
+  # result_is_visible <window-active> <popup-count> <output-variable>
+  local window_active="$1" popup_count="$2" output_var="$3" result=0
+  case "$popup_count" in ''|*[!0-9]*) popup_count=0 ;; esac
+  [ "$window_active" = 1 ] && [ "$popup_count" -eq 0 ] && result=1
+  printf -v "$output_var" '%s' "$result"
+}
+
+set_window_status() {
+  # set_window_status <window-id> <current> <desired>
+  local window="$1" current="$2" desired="$3"
   [ "$current" = "$desired" ] && return 0
   if [ -z "$desired" ]; then
-    tm set-option -w -u -t "$pane" "$STATUS_VAR" >/dev/null 2>&1 || true
+    tm set-option -w -u -t "$window" "$STATUS_VAR" >/dev/null 2>&1 || true
   else
-    tm set-option -w -t "$pane" "$STATUS_VAR" "$desired" >/dev/null 2>&1 || true
+    tm set-option -w -t "$window" "$STATUS_VAR" "$desired" >/dev/null 2>&1 || true
   fi
 }
 
 reconcile() {
-  snapshot_processes
+  local pane_snapshot pane_format pane_fingerprint=""
+  local fp_pane fp_window fp_pid fp_pane_active fp_window_active
+  local fp_current fp_ts fp_seen fp_popup fp_command
+  local poll_now_us process_refreshed=0
+  if [ -n "${EPOCHREALTIME:-}" ]; then
+    poll_now_us="${EPOCHREALTIME/./}"
+  else
+    poll_now_us=$(( $(date +%s) * 1000000 ))
+  fi
 
-  # Drop cached codex rollout handles for processes that have exited.
-  local _p
-  for _p in "${!CODEX_FILE_OF[@]}"; do
-    [ -n "${PPID_OF[$_p]:-}" ] || unset 'CODEX_FILE_OF[$_p]'
+  pane_format="#{pane_id}"$'\t'"#{window_id}"$'\t'"#{pane_pid}"$'\t'"#{pane_active}"$'\t'"#{window_active}"$'\t'"#{?$STATUS_VAR,#{$STATUS_VAR},-}"$'\t'"#{?@agent_status_ts,#{@agent_status_ts},0}"$'\t'"#{?@agent_status_seen,#{@agent_status_seen},0}"$'\t'"#{?@agent_status_popup_count,#{@agent_status_popup_count},0}"$'\t'"#{pane_current_command}"
+  pane_snapshot="$(tm list-panes -a -F "$pane_format" 2>/dev/null)"
+  while IFS=$'\t' read -r fp_pane fp_window fp_pid fp_pane_active \
+    fp_window_active fp_current fp_ts fp_seen fp_popup fp_command; do
+    [ -n "${fp_pane:-}" ] || continue
+    pane_fingerprint+="${pane_fingerprint:+$'\n'}$fp_pane"$'\t'"$fp_pid"$'\t'"$fp_command"
+  done <<< "$pane_snapshot"
+
+  # Foreground command or pane changes refresh the process tree immediately.
+  # A slow watchdog covers nested launchers whose foreground name stays fixed.
+  if [ "$pane_fingerprint" != "$PANE_PROCESS_FINGERPRINT" ] \
+    || [ $(( 10#$poll_now_us - PROCESS_SNAPSHOT_AT_US )) -ge "$PROCESS_SNAPSHOT_TTL_US" ]; then
+    snapshot_processes
+    PROCESS_SNAPSHOT_AT_US=$(( 10#$poll_now_us ))
+    PANE_PROCESS_FINGERPRINT="$pane_fingerprint"
+    process_refreshed=1
+  fi
+
+  # Known rollout contents are still checked every poll. Handle discovery is
+  # refreshed on process changes and every two seconds for resumed rollouts.
+  if [ "$process_refreshed" = 1 ] \
+    || [ $(( 10#$poll_now_us - CODEX_SNAPSHOT_AT_US )) -ge "$CODEX_SNAPSHOT_TTL_US" ]; then
+    snapshot_codex_files
+    CODEX_SNAPSHOT_AT_US=$(( 10#$poll_now_us ))
+  fi
+  snapshot_codex_sizes
+
+  # Drop cached agent state after its process exits.
+  local _p _f
+  for _p in "${!CLAUDE_FILE_OF[@]}"; do
+    if [ -z "${PPID_OF[$_p]:-}" ]; then
+      _f="${CLAUDE_FILE_OF[$_p]}"
+      unset 'CLAUDE_FILE_OF[$_p]' 'CLAUDE_CONTENT_OF[$_f]' \
+        'CLAUDE_STATUS_OF[$_f]' 'CLAUDE_TS_OF[$_f]'
+    fi
+  done
+  for _p in "${!CODEX_FILES_OF[@]}"; do
+    [ -n "${PPID_OF[$_p]:-}" ] || unset 'CODEX_FILES_OF[$_p]'
+  done
+  for _f in "${!CODEX_FILE_PID_OF[@]}"; do
+    _p="${CODEX_FILE_PID_OF[$_f]}"
+    if [ -z "${PPID_OF[$_p]:-}" ]; then
+      unset 'CODEX_FILE_PID_OF[$_f]' 'CODEX_KNOWN_OF[$_f]' \
+        'CODEX_STATUS_OF[$_f]' 'CODEX_TS_OF[$_f]' 'CODEX_SIZE_OF[$_f]'
+    fi
   done
 
   local now_ms thr_ms
-  now_ms=$(( $(date +%s) * 1000 ))
+  if [ -n "${EPOCHSECONDS:-}" ]; then
+    now_ms=$(( EPOCHSECONDS * 1000 ))
+  else
+    now_ms=$(( $(date +%s) * 1000 ))
+  fi
   thr_ms=$(( RECENT_DAYS * 86400 * 1000 ))
 
-  local pane pane_pid pane_active win_active current
+  local pane window pane_pid pane_active win_active current current_ts current_seen popup_count pane_command
   local st ts base viewing final seen
-  local apid akind ast ats rank best win_st win_ts
+  local apid akind ast ats rank current_rank agent_pids
+  local -A WINDOW_KNOWN=() WINDOW_CURRENT=() WINDOW_CURRENT_TS=()
+  local -A WINDOW_SEEN=() WINDOW_ACTIVE=() WINDOW_POPUP=()
+  local -A WINDOW_STATUS=() WINDOW_TS=() WINDOW_RANK=()
 
-  while IFS=$'\t' read -r pane pane_pid pane_active win_active current; do
+  # First reduce every agent from every pane into one state per window. The
+  # status option is window-scoped, so writing once per pane makes an empty pane
+  # fight an agent pane using the same stale snapshot and causes icon flicker.
+  while IFS=$'\t' read -r pane window pane_pid pane_active win_active current \
+    current_ts current_seen popup_count pane_command; do
     [ -z "${pane:-}" ] && continue
-    base=""; ts=0
-    viewing=0; [ "$win_active" = "1" ] && viewing=1
+    [ "$current" = "-" ] && current=""
+    if [ -z "${WINDOW_KNOWN[$window]:-}" ]; then
+      WINDOW_KNOWN["$window"]=1
+      WINDOW_CURRENT["$window"]="$current"
+      WINDOW_CURRENT_TS["$window"]="${current_ts:-0}"
+      WINDOW_SEEN["$window"]="${current_seen:-0}"
+      WINDOW_ACTIVE["$window"]="$win_active"
+      WINDOW_POPUP["$window"]="${popup_count:-0}"
+      WINDOW_STATUS["$window"]=""
+      WINDOW_TS["$window"]=0
+      WINDOW_RANK["$window"]=0
+    fi
+    # A linked window may appear through more than one session. Treat it as
+    # visible if any occurrence is active rather than trusting list order.
+    [ "$win_active" = 1 ] && WINDOW_ACTIVE["$window"]=1
 
-    # A pane may host several agents (e.g. a claude and a codex side by side).
-    # Report the MOST ACTIVE one — precedence busy/shell > waiting > idle, with
-    # the more recent ts breaking ties. Without this an idle codex could blank
-    # the icon of a busy claude sharing the window (and vice versa).
-    win_st=""; win_ts=0; best=0
+    agent_pids=""
+    find_agent_pids "$pane_pid" agent_pids || true
     while IFS=$'\t' read -r apid akind; do
       [ -z "${apid:-}" ] && continue
       if [ "$akind" = "codex" ]; then
@@ -267,7 +543,8 @@ reconcile() {
         ast=""; ats=0
         status_for_codex_pid "$apid" ast ats
       else
-        IFS=$'\t' read -r ast ats < <(status_for_pid "$apid")
+        ast=""; ats=0
+        status_for_pid "$apid" ast ats
       fi
       case "$ast" in
         busy|shell) rank=3 ;;
@@ -275,41 +552,39 @@ reconcile() {
         idle)       rank=1 ;;
         *)          rank=0 ;;
       esac
-      if [ "$rank" -gt "$best" ] \
-        || { [ "$rank" -eq "$best" ] && [ "${ats:-0}" -gt "${win_ts:-0}" ] 2>/dev/null; }; then
-        best="$rank"; win_st="$ast"; win_ts="${ats:-0}"
+      current_rank="${WINDOW_RANK[$window]:-0}"
+      if [ "$rank" -gt "$current_rank" ] \
+        || { [ "$rank" -eq "$current_rank" ] \
+          && [ "${ats:-0}" -gt "${WINDOW_TS[$window]:-0}" ] 2>/dev/null; }; then
+        WINDOW_RANK["$window"]="$rank"
+        WINDOW_STATUS["$window"]="$ast"
+        WINDOW_TS["$window"]="${ats:-0}"
       fi
-    done < <(find_agent_pids "$pane_pid")
+    done <<< "$agent_pids"
+  done <<< "$pane_snapshot"
 
-    st="$win_st"; ts="${win_ts:-0}"
-    if [ -n "$st" ]; then
-      case "$st" in
-        busy|shell) base="$ICON_WORKING" ;;
-        waiting)
-          # Urgent: show until viewed; re-show if still waiting after you leave.
-          [ "$viewing" = "1" ] && base="" || base="$ICON_WAITING"
-          ;;
-        idle)
-          # Sticky done: cleared once the window has been viewed at/after this
-          # completion, and stays cleared until a NEW completion (newer
-          # statusUpdatedAt) arrives. "Seen" is a per-window tmux option
-          # (@agent_status_seen) stamped by the after-select-window hook the
-          # moment you view a window — so it survives quick visits the 2s poll
-          # would otherwise miss, and daemon restarts. We also stamp it here
-          # while you're actively viewing (covers completing while watched).
-          seen="$(tm show-option -wqv -t "$pane" @agent_status_seen 2>/dev/null)"
-          seen="${seen:-0}"
-          if [ "$viewing" = "1" ]; then
-            tm set-option -w -t "$pane" @agent_status_seen "$ts" >/dev/null 2>&1 || true
-            base=""
-          elif [ "$seen" -ge "$ts" ] 2>/dev/null; then
-            base=""
-          else
-            base="$ICON_DONE"
-          fi
-          ;;
-      esac
+  # Apply sticky-done and publish status exactly once for each window.
+  for window in "${!WINDOW_KNOWN[@]}"; do
+    current="${WINDOW_CURRENT[$window]}"
+    current_ts="${WINDOW_CURRENT_TS[$window]:-0}"
+    current_seen="${WINDOW_SEEN[$window]:-0}"
+    st="${WINDOW_STATUS[$window]:-}"
+    ts="${WINDOW_TS[$window]:-0}"
+    base=""
+    result_is_visible "${WINDOW_ACTIVE[$window]}" \
+      "${WINDOW_POPUP[$window]:-0}" viewing
+    seen=0
+    if [ "$st" = "idle" ]; then
+      # Sticky done: cleared once the window has been viewed at/after this
+      # completion, and stays cleared until a NEW completion. Only done uses
+      # the seen marker; working and waiting remain visible while viewed.
+      seen="${current_seen:-0}"
+      if [ "$viewing" = "1" ] && [ "$seen" -lt "$ts" ] 2>/dev/null; then
+        tm set-option -w -t "$window" @agent_status_seen "$ts" >/dev/null 2>&1 || true
+        seen="$ts"
+      fi
     fi
+    base_icon_for_status "$st" "$viewing" "$seen" "$ts" base
 
     # Compose final icon, appending the recency marker for sessions active
     # within RECENT_DAYS.
@@ -321,17 +596,45 @@ reconcile() {
     else
       final="$base"
     fi
-    set_pane_status "$pane" "$current" "$final"
+    set_window_status "$window" "$current" "$final"
     # Publish the status timestamp (statusUpdatedAt = finish time when done,
-    # trigger time when working) so consumers can sort by it. Unlike
-    # window_activity it does NOT churn while a session keeps running.
-    if [ -n "$base" ] && [ "$ts" -gt 0 ] 2>/dev/null; then
-      [ "$(tm show-option -wqv -t "$pane" @agent_status_ts 2>/dev/null)" = "$ts" ] \
-        || tm set-option -w -t "$pane" @agent_status_ts "$ts" >/dev/null 2>&1 || true
+    # trigger time when working) so consumers can sort by it. Keep it after a
+    # done icon is seen: icon visibility and the latest agent boundary are
+    # separate state, and consumers must not fall back to churning pane output.
+    if [ -n "$st" ] && [ "$ts" -gt 0 ] 2>/dev/null; then
+      [ "${current_ts:-0}" = "$ts" ] \
+        || tm set-option -w -t "$window" @agent_status_ts "$ts" >/dev/null 2>&1 || true
     else
-      tm set-option -w -u -t "$pane" @agent_status_ts >/dev/null 2>&1 || true
+      [ "${current_ts:-0}" = "0" ] \
+        || tm set-option -w -u -t "$window" @agent_status_ts >/dev/null 2>&1 || true
     fi
-  done < <(tm list-panes -a -F "#{pane_id}	#{pane_pid}	#{pane_active}	#{window_active}	#{$STATUS_VAR}" 2>/dev/null)
+  done
+}
+
+# Clean up only our own recorded PID on exit. An older daemon may finish after a
+# replacement has already published its PID; unconditionally unsetting the
+# option here would orphan the replacement and allow another duplicate launch.
+clear_recorded_pid() {
+  [ "$(tm show-option -gqv @agent_status_pid 2>/dev/null)" = "$$" ] \
+    && tm set-option -gu @agent_status_pid >/dev/null 2>&1 || true
+}
+
+wait_for_next_poll() {
+  local cycle_started="$1"
+  if [ -n "$cycle_started" ]; then
+    local cycle_finished="$EPOCHREALTIME" started_us finished_us remaining_us
+    local remaining_sleep
+    started_us="${cycle_started/./}"
+    finished_us="${cycle_finished/./}"
+    remaining_us=$(( INTERVAL_US - (10#$finished_us - 10#$started_us) ))
+    if [ "$remaining_us" -gt 0 ]; then
+      printf -v remaining_sleep '%d.%06d' \
+        "$(( remaining_us / 1000000 ))" "$(( remaining_us % 1000000 ))"
+      sleep "$remaining_sleep"
+    fi
+  else
+    sleep "$INTERVAL"
+  fi
 }
 
 # One-shot mode: reconcile once and exit (for testing / manual refresh).
@@ -342,11 +645,11 @@ elif [ -n "${AGENT_STATUS_ONESHOT:-}" ]; then
   exit 0
 fi
 
-# Clean up our recorded PID on exit.
-trap 'tm set-option -gu @agent_status_pid >/dev/null 2>&1 || true' EXIT
+trap clear_recorded_pid EXIT
 
 while true; do
   server_alive || exit 0
+  cycle_started="${EPOCHREALTIME:-}"
   reconcile
-  sleep "$INTERVAL"
+  wait_for_next_poll "$cycle_started"
 done

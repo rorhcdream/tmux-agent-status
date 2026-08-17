@@ -28,9 +28,10 @@ and no false positives on long, quiet generations.
 
 Codex has no per-pid status file — it writes an append-only event log per session
 (`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`). The daemon bridges a running
-`codex` process to the freshest rollout file it holds open with `lsof` (a resumed
-process can retain several), then caches that mapping so it survives the handle
-closing between turns. It derives status from the last turn-boundary event:
+`codex` process to the rollout files it holds open with `lsof` (a resumed or
+multi-agent process can retain several), aggregates them with working taking
+precedence over done, then caches that set so it survives handles closing between
+turns. It derives each rollout's status from the last turn-boundary event:
 `task_started` → working, `task_complete` → done, `turn_aborted` → cleared.
 Everything downstream (icons, sticky-done, recency) is shared with the Claude path,
 so a codex pane looks identical.
@@ -40,7 +41,7 @@ so a codex pane looks identical.
 | Claude `status` | tmux icon            |
 | --------------- | -------------------- |
 | `busy`, `shell` | 🤖 working           |
-| `waiting`       | 💬 waiting (until you view the window) |
+| `waiting`       | 💬 waiting until the agent continues |
 | `idle`          | ✅ done — **sticky** until you view the window once |
 | no agent proc   | (icon cleared)       |
 
@@ -51,8 +52,8 @@ same working / done / cleared states.)
 
 When a session finishes, its ✅ stays in the window list until you actually switch
 to that window. Once viewed, it clears and stays quiet — it will **not** re-appear
-until the *next* completion. `waiting` behaves similarly but re-appears if it's still
-waiting after you look away, since it needs your input.
+until the *next* completion. Working and waiting icons are never cleared by viewing
+the window; they remain until the agent itself changes state.
 
 The "viewed" signal comes from an `after-select-window` hook the plugin installs: the
 instant you select a window it stamps that window with a `@agent_status_seen`
@@ -82,7 +83,9 @@ win 4: 🤖 •   (working now)
 companion fzf popup that lists your tmux windows and workspace tasks. It consumes
 this plugin's `@agent_status` icons and `@agent_status_ts` timestamps to group and
 sort rows (finished → waiting → running). Each plugin works standalone, but they
-are designed to be used together.
+are designed to be used together. While its popup covers the active pane, the
+tree publishes `@agent_status_popup_count`; this plugin then preserves a new done
+status until the popup closes and the result is actually visible.
 
 ## Requirements
 
@@ -134,7 +137,7 @@ its own `@agent_status` variable and wires it into your window list automaticall
 ## Configuration
 
 ```tmux
-set -g @agent_status_interval 2          # poll seconds (default 2)
+set -g @agent_status_interval 0.5        # poll cadence in seconds (default 0.5)
 set -g @agent_status_working  '🤖'
 set -g @agent_status_waiting  '💬'
 set -g @agent_status_done     '✅'
