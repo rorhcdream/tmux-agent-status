@@ -181,6 +181,8 @@ assert_eq 200 "$timestamp" 'changed Claude timestamp should refresh cache'
 # clear the same option using a stale per-window snapshot.
 STATUS_WRITES=0
 STATUS_VALUE=""
+SUMMARY_WRITES=0
+SUMMARY_VALUE=""
 TIMESTAMP_WRITES=0
 TIMESTAMP_VALUE=0
 MOCK_CURRENT="-"
@@ -189,19 +191,24 @@ MOCK_AGENT_STATE=busy
 MOCK_AGENT_TIMESTAMP=100
 tm() {
   if [ "${1:-}" = list-panes ]; then
-    printf '%%1\t@1\t100\t1\t1\t%s\t%s\t0\t0\tcodex\n' "$MOCK_CURRENT" "$MOCK_TIMESTAMP"
-    printf '%%2\t@1\t200\t0\t1\t%s\t%s\t0\t0\tzsh\n' "$MOCK_CURRENT" "$MOCK_TIMESTAMP"
+    printf '%%1\t@1\t$1\t1\t100\t1\t1\t%s\t%s\t0\t0\t%s\tcodex\n' "$MOCK_CURRENT" "$MOCK_TIMESTAMP" "${SUMMARY_VALUE:--}"
+    printf '%%2\t@1\t$1\t1\t200\t0\t1\t%s\t%s\t0\t0\t%s\tzsh\n' "$MOCK_CURRENT" "$MOCK_TIMESTAMP" "${SUMMARY_VALUE:--}"
     return
   fi
   if [ "${1:-}" = set-option ]; then
-    local arg is_status=0 is_timestamp=0 is_unset=0
+    local arg is_status=0 is_summary=0 is_timestamp=0 is_unset=0
     for arg in "$@"; do [ "$arg" = "$STATUS_VAR" ] && is_status=1; done
+    for arg in "$@"; do [ "$arg" = "$SUMMARY_VAR" ] && is_summary=1; done
     for arg in "$@"; do [ "$arg" = @agent_status_ts ] && is_timestamp=1; done
     for arg in "$@"; do [ "$arg" = -u ] && is_unset=1; done
     if [ "$is_status" = 1 ]; then
       STATUS_WRITES=$((STATUS_WRITES + 1))
       if [ "$is_unset" = 1 ]; then STATUS_VALUE=""; else STATUS_VALUE="${*: -1}"; fi
       if [ -n "$STATUS_VALUE" ]; then MOCK_CURRENT="$STATUS_VALUE"; else MOCK_CURRENT="-"; fi
+    fi
+    if [ "$is_summary" = 1 ]; then
+      SUMMARY_WRITES=$((SUMMARY_WRITES + 1))
+      if [ "$is_unset" = 1 ]; then SUMMARY_VALUE=""; else SUMMARY_VALUE="${*: -1}"; fi
     fi
     if [ "$is_timestamp" = 1 ]; then
       TIMESTAMP_WRITES=$((TIMESTAMP_WRITES + 1))
@@ -230,9 +237,12 @@ assert_eq 1 "$STATUS_WRITES" 'multi-pane window should receive one status write'
 assert_eq "$ICON_WORKING" "$STATUS_VALUE" 'agent pane should keep the window working'
 assert_eq 1 "$TIMESTAMP_WRITES" 'working status should publish its timestamp once'
 assert_eq 100 "$TIMESTAMP_VALUE" 'working timestamp should match the agent boundary'
+assert_eq 1 "$SUMMARY_WRITES" 'session summary should be written once'
+assert_eq "1:$ICON_WORKING" "$SUMMARY_VALUE" 'session summary should pair the window index with its icon'
 reconcile
 assert_eq 1 "$STATUS_WRITES" 'empty sibling pane must not clear or rewrite the icon'
 assert_eq 1 "$TIMESTAMP_WRITES" 'unchanged agent timestamp should not be rewritten'
+assert_eq 1 "$SUMMARY_WRITES" 'unchanged session summary should not be rewritten'
 
 # Seeing a completion clears only the done icon. The boundary timestamp remains
 # available to consumers such as workspace-tree instead of falling back to pane
@@ -241,9 +251,55 @@ MOCK_AGENT_STATE=idle
 MOCK_AGENT_TIMESTAMP=200
 reconcile
 assert_eq '' "$STATUS_VALUE" 'viewing a completion should clear its done icon'
+assert_eq '' "$SUMMARY_VALUE" 'viewing a completion should clear it from the session summary'
 assert_eq 2 "$TIMESTAMP_WRITES" 'seen completion should publish its timestamp'
 assert_eq 200 "$TIMESTAMP_VALUE" 'completion timestamp should remain available after being seen'
 reconcile
 assert_eq 2 "$TIMESTAMP_WRITES" 'seen completion timestamp should remain stable'
 
-printf 'ok - Codex rollout aggregation and viewed-status behavior\n'
+# Summaries are session-scoped: linked windows may have a different index in
+# each session, and each session must list its windows in tmux window order.
+declare -A SUMMARY_BY_SESSION=()
+tm() {
+  if [ "${1:-}" = list-panes ]; then
+    printf '%%1\t@1\t$1\t4\t100\t1\t0\t-\t0\t0\t0\t-\tcodex\n'
+    printf '%%3\t@2\t$1\t9\t300\t1\t0\t-\t0\t0\t0\t-\tcodex\n'
+    printf '%%1\t@1\t$2\t7\t100\t1\t0\t-\t0\t0\t0\t-\tcodex\n'
+    return
+  fi
+  if [ "${1:-}" = set-option ]; then
+    local arg target="" is_summary=0 take_target=0
+    for arg in "$@"; do
+      if [ "$take_target" = 1 ]; then target="$arg"; take_target=0; fi
+      [ "$arg" = -t ] && take_target=1
+      [ "$arg" = "$SUMMARY_VAR" ] && is_summary=1
+    done
+    if [ "$is_summary" = 1 ]; then
+      SUMMARY_BY_SESSION["$target"]="${*: -1}"
+    fi
+  fi
+}
+snapshot_processes() {
+  PPID_OF=([100]=1 [300]=1)
+  COMM_OF=([100]=codex [300]=codex)
+  CHILDREN_OF=([1]='100 300')
+  HAS_CODEX_PROCESS=1
+}
+status_for_codex_pid() {
+  if [ "$1" = 100 ]; then
+    printf -v "$2" busy
+  else
+    printf -v "$2" waiting
+  fi
+  printf -v "$3" 100
+}
+PROCESS_SNAPSHOT_AT_US=0
+CODEX_SNAPSHOT_AT_US=0
+PANE_PROCESS_FINGERPRINT=""
+reconcile
+assert_eq "4:$ICON_WORKING 9:$ICON_WAITING" "${SUMMARY_BY_SESSION['$1']:-}" \
+  'summary should retain window order within the first session'
+assert_eq "7:$ICON_WORKING" "${SUMMARY_BY_SESSION['$2']:-}" \
+  'linked window should use its index in the second session'
+
+printf 'ok - Codex rollout aggregation, viewed status, and session summaries\n'

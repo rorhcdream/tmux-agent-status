@@ -37,10 +37,13 @@ ICON_WORKING="$(tmux_opt @agent_status_working '🤖')"
 ICON_WAITING="$(tmux_opt @agent_status_waiting '💬')"
 ICON_DONE="$(tmux_opt @agent_status_done '✅')"
 SET_FORMAT="$(tmux_opt @agent_status_set_format 1)"
+SET_SUMMARY="$(tmux_opt @agent_status_set_summary 1)"
 RECENT_MARKER="$(tmux_opt @agent_status_recent_marker '•')"
 RECENT_DAYS="$(tmux_opt @agent_status_recent_days 3)"
 # tmux user-option the icon is written to.
 STATUS_VAR="$(tmux_opt @agent_status_var @agent_status)"
+# Session-scoped user-option containing entries such as `1:🤖 3:💬`.
+SUMMARY_VAR="$(tmux_opt @agent_status_summary_var @agent_status_summary)"
 
 # Teardown: `agent-status.tmux stop` — kill the daemon and clear our icons.
 # (The format keeps a harmless empty `#{?@agent_status,...}` until next reload.)
@@ -72,6 +75,9 @@ if [ "${1:-}" = "stop" ] || [ "${1:-}" = "uninstall" ]; then
       tmux set-option -w -u -t "$p" @agent_status_ts 2>/dev/null || true
       tmux set-option -w -u -t "$p" @agent_status_seen 2>/dev/null || true
     fi
+  done
+  tmux list-sessions -F '#{session_id}' 2>/dev/null | while read -r s; do
+    tmux set-option -u -t "$s" "$SUMMARY_VAR" 2>/dev/null || true
   done
   # Remove ONLY our own seen-stamp hook(s), matched by this plugin's path, so we
   # never clobber unrelated after-select-window hooks. Unset highest index first
@@ -111,6 +117,23 @@ if [ "$SET_FORMAT" = "1" ]; then
   inject_format window-status-current-format
 fi
 
+# Add a compact all-agent section to the right side of each session's status
+# line. The value itself is session-scoped because linked windows can have a
+# different number in each session. Preserve the user's existing status-right
+# format and only append our conditional slot once.
+inject_summary_format() {
+  local existing
+  existing="$(tmux show-option -gqv status-right 2>/dev/null || true)"
+  case "$existing" in
+    *"$SUMMARY_VAR"*) return 0 ;;
+  esac
+  tmux set-option -g status-right \
+    "$existing#{?$SUMMARY_VAR, #[default]#{$SUMMARY_VAR},}"
+}
+if [ "$SET_SUMMARY" = "1" ]; then
+  inject_summary_format
+fi
+
 # Stamp @agent_status_seen the instant a window is viewed, so a finished
 # window's done icon clears even on a visit shorter than one poll interval.
 # Appended (-ga) so we don't clobber a user's own after-select-window hook, and
@@ -137,6 +160,7 @@ run_daemon() {
   AGENT_STATUS_SOCKET="$SOCKET" \
   AGENT_STATUS_INTERVAL="$INTERVAL" \
   AGENT_STATUS_VAR="$STATUS_VAR" \
+  AGENT_STATUS_SUMMARY_VAR="$SUMMARY_VAR" \
   AGENT_STATUS_ICON_WORKING="$ICON_WORKING" \
   AGENT_STATUS_ICON_WAITING="$ICON_WAITING" \
   AGENT_STATUS_ICON_DONE="$ICON_DONE" \
@@ -149,7 +173,7 @@ run_daemon() {
 # `setsid bash -c` path starts a FRESH shell that only receives the serialized
 # function body — without these exports POLLER/SOCKET/… would be empty there and
 # the daemon would exec an empty path.
-export POLLER SOCKET INTERVAL STATUS_VAR \
+export POLLER SOCKET INTERVAL STATUS_VAR SUMMARY_VAR \
   ICON_WORKING ICON_WAITING ICON_DONE RECENT_MARKER RECENT_DAYS
 
 if command -v setsid >/dev/null 2>&1; then

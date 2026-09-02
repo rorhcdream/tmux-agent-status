@@ -1,8 +1,16 @@
 # tmux-agent-status
 
-A tmux plugin that shows each coding agent's status in your tmux window list,
-driven by the agent's **own on-disk session state** instead of hooks. Supports
-**Claude Code** and **Codex**.
+A tmux plugin that shows each coding agent's status in your tmux window list and
+collects every visible agent into a compact status-right section, driven by the
+agent's **own on-disk session state** instead of hooks. Supports **Claude Code**
+and **Codex**.
+
+For example, a session with working agents in windows 1 and 4 and a waiting
+agent in window 6 shows:
+
+```text
+1:🤖 • 4:🤖 • 6:💬 •
+```
 
 ## Why this exists
 
@@ -143,6 +151,8 @@ set -g @agent_status_waiting  '💬'
 set -g @agent_status_done     '✅'
 set -g @agent_status_var      '@agent_status'   # tmux option the icon is written to
 set -g @agent_status_set_format 1        # wire window-status-format (default on)
+set -g @agent_status_summary_var '@agent_status_summary'
+set -g @agent_status_set_summary 1       # append summary to status-right (default on)
 set -g @agent_status_recent_marker '•'   # marker for sessions active recently
 set -g @agent_status_recent_days   3     # "recent" window in days (0 disables)
 ```
@@ -154,6 +164,14 @@ The icon is written to the tmux user-option named by `@agent_status_var` (defaul
 to a built-in default if you have no format set. Set `@agent_status_set_format 0` if
 you'd rather place `#{@agent_status}` in your format yourself.
 
+The summary is written to the session-scoped option named by
+`@agent_status_summary_var` (default `@agent_status_summary`) as space-separated
+`window-number:icon` entries. With `@agent_status_set_summary` on, the plugin
+appends a conditional slot to your existing `status-right` without replacing
+your theme. Set it to `0` to place `#{@agent_status_summary}` yourself. Because
+the option is session-scoped, linked windows use the correct number in each
+session.
+
 ## How it works
 
 - `agent-status.tmux` — entry point tmux runs on load. Launches the daemon detached
@@ -161,8 +179,8 @@ you'd rather place `#{@agent_status}` in your format yourself.
   passes the tmux socket so the daemon targets the right server.
 - `scripts/poller.sh` — the loop: snapshot processes, find every `claude`/`codex`
   descendant of each pane's `pane_pid`, read each one's status, pick the **most active**
-  (working > waiting > done) when a pane runs several, and reconcile the status option
-  (only writing when the value actually changes).
+  (working > waiting > done) when a pane runs several, and reconcile the window icon
+  and per-session summary (only writing when a value actually changes).
 
 ## Testing
 

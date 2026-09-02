@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Background daemon: reads per-session status for the coding agent running in
-# each tmux pane and drives a tmux status option (default @agent_status). Two
-# agents are supported, each with its own storage model:
+# each tmux pane and drives a per-window status option (default @agent_status)
+# plus a per-session summary (default @agent_status_summary). Two agents are
+# supported, each with its own storage model:
 #   claude -> ~/.claude*/sessions/<pid>.json  (explicit status, keyed by pid)
 #   codex  -> ~/.codex/sessions/.../rollout-*.jsonl  (status derived from the
 #             append-only event log; pid bridged to its file via lsof, cached)
@@ -20,6 +21,7 @@
 #
 # Configured via env vars set by the .tmux entry script:
 #   AGENT_STATUS_SOCKET, AGENT_STATUS_INTERVAL, AGENT_STATUS_VAR,
+#   AGENT_STATUS_SUMMARY_VAR,
 #   AGENT_STATUS_ICON_WORKING/WAITING/DONE,
 #   AGENT_STATUS_RECENT_MARKER, AGENT_STATUS_RECENT_DAYS
 
@@ -28,6 +30,7 @@ set -uo pipefail
 SOCKET="${AGENT_STATUS_SOCKET:-}"
 INTERVAL="${AGENT_STATUS_INTERVAL:-0.5}"
 STATUS_VAR="${AGENT_STATUS_VAR:-@agent_status}"
+SUMMARY_VAR="${AGENT_STATUS_SUMMARY_VAR:-@agent_status_summary}"
 ICON_WORKING="${AGENT_STATUS_ICON_WORKING:-🤖}"
 ICON_WAITING="${AGENT_STATUS_ICON_WAITING:-💬}"
 ICON_DONE="${AGENT_STATUS_ICON_DONE:-✅}"
@@ -438,10 +441,21 @@ set_window_status() {
   fi
 }
 
+set_session_summary() {
+  # set_session_summary <session-id> <current> <desired>
+  local session="$1" current="$2" desired="$3"
+  [ "$current" = "$desired" ] && return 0
+  if [ -z "$desired" ]; then
+    tm set-option -u -t "$session" "$SUMMARY_VAR" >/dev/null 2>&1 || true
+  else
+    tm set-option -t "$session" "$SUMMARY_VAR" "$desired" >/dev/null 2>&1 || true
+  fi
+}
+
 reconcile() {
   local pane_snapshot pane_format pane_fingerprint=""
-  local fp_pane fp_window fp_pid fp_pane_active fp_window_active
-  local fp_current fp_ts fp_seen fp_popup fp_command
+  local fp_pane fp_window fp_session fp_index fp_pid fp_pane_active fp_window_active
+  local fp_current fp_ts fp_seen fp_popup fp_summary fp_command
   local poll_now_us process_refreshed=0
   if [ -n "${EPOCHREALTIME:-}" ]; then
     poll_now_us="${EPOCHREALTIME/./}"
@@ -449,10 +463,11 @@ reconcile() {
     poll_now_us=$(( $(date +%s) * 1000000 ))
   fi
 
-  pane_format="#{pane_id}"$'\t'"#{window_id}"$'\t'"#{pane_pid}"$'\t'"#{pane_active}"$'\t'"#{window_active}"$'\t'"#{?$STATUS_VAR,#{$STATUS_VAR},-}"$'\t'"#{?@agent_status_ts,#{@agent_status_ts},0}"$'\t'"#{?@agent_status_seen,#{@agent_status_seen},0}"$'\t'"#{?@agent_status_popup_count,#{@agent_status_popup_count},0}"$'\t'"#{pane_current_command}"
+  pane_format="#{pane_id}"$'\t'"#{window_id}"$'\t'"#{session_id}"$'\t'"#{window_index}"$'\t'"#{pane_pid}"$'\t'"#{pane_active}"$'\t'"#{window_active}"$'\t'"#{?$STATUS_VAR,#{$STATUS_VAR},-}"$'\t'"#{?@agent_status_ts,#{@agent_status_ts},0}"$'\t'"#{?@agent_status_seen,#{@agent_status_seen},0}"$'\t'"#{?@agent_status_popup_count,#{@agent_status_popup_count},0}"$'\t'"#{?$SUMMARY_VAR,#{$SUMMARY_VAR},-}"$'\t'"#{pane_current_command}"
   pane_snapshot="$(tm list-panes -a -F "$pane_format" 2>/dev/null)"
-  while IFS=$'\t' read -r fp_pane fp_window fp_pid fp_pane_active \
-    fp_window_active fp_current fp_ts fp_seen fp_popup fp_command; do
+  while IFS=$'\t' read -r fp_pane fp_window fp_session fp_index fp_pid \
+    fp_pane_active fp_window_active fp_current fp_ts fp_seen fp_popup \
+    fp_summary fp_command; do
     [ -n "${fp_pane:-}" ] || continue
     pane_fingerprint+="${pane_fingerprint:+$'\n'}$fp_pane"$'\t'"$fp_pid"$'\t'"$fp_command"
   done <<< "$pane_snapshot"
@@ -504,20 +519,34 @@ reconcile() {
   fi
   thr_ms=$(( RECENT_DAYS * 86400 * 1000 ))
 
-  local pane window pane_pid pane_active win_active current current_ts current_seen popup_count pane_command
+  local pane window session window_index pane_pid pane_active win_active current current_ts current_seen popup_count current_summary pane_command
   local st ts base viewing final seen
   local apid akind ast ats rank current_rank agent_pids
   local -A WINDOW_KNOWN=() WINDOW_CURRENT=() WINDOW_CURRENT_TS=()
   local -A WINDOW_SEEN=() WINDOW_ACTIVE=() WINDOW_POPUP=()
-  local -A WINDOW_STATUS=() WINDOW_TS=() WINDOW_RANK=()
+  local -A WINDOW_STATUS=() WINDOW_TS=() WINDOW_RANK=() WINDOW_FINAL=()
+  local -A SESSION_KNOWN=() SESSION_CURRENT=() SESSION_WINDOWS=()
+  local -A SESSION_WINDOW_KNOWN=() SESSION_WINDOW_INDEX=()
 
   # First reduce every agent from every pane into one state per window. The
   # status option is window-scoped, so writing once per pane makes an empty pane
   # fight an agent pane using the same stale snapshot and causes icon flicker.
-  while IFS=$'\t' read -r pane window pane_pid pane_active win_active current \
-    current_ts current_seen popup_count pane_command; do
+  while IFS=$'\t' read -r pane window session window_index pane_pid pane_active \
+    win_active current current_ts current_seen popup_count current_summary \
+    pane_command; do
     [ -z "${pane:-}" ] && continue
     [ "$current" = "-" ] && current=""
+    [ "$current_summary" = "-" ] && current_summary=""
+    if [ -z "${SESSION_KNOWN[$session]:-}" ]; then
+      SESSION_KNOWN["$session"]=1
+      SESSION_CURRENT["$session"]="$current_summary"
+      SESSION_WINDOWS["$session"]=""
+    fi
+    if [ -z "${SESSION_WINDOW_KNOWN[$session:$window]:-}" ]; then
+      SESSION_WINDOW_KNOWN["$session:$window"]=1
+      SESSION_WINDOW_INDEX["$session:$window"]="$window_index"
+      SESSION_WINDOWS["$session"]+="${SESSION_WINDOWS[$session]:+ }$window"
+    fi
     if [ -z "${WINDOW_KNOWN[$window]:-}" ]; then
       WINDOW_KNOWN["$window"]=1
       WINDOW_CURRENT["$window"]="$current"
@@ -596,6 +625,7 @@ reconcile() {
     else
       final="$base"
     fi
+    WINDOW_FINAL["$window"]="$final"
     set_window_status "$window" "$current" "$final"
     # Publish the status timestamp (statusUpdatedAt = finish time when done,
     # trigger time when working) so consumers can sort by it. Keep it after a
@@ -608,6 +638,21 @@ reconcile() {
       [ "${current_ts:-0}" = "0" ] \
         || tm set-option -w -u -t "$window" @agent_status_ts >/dev/null 2>&1 || true
     fi
+  done
+
+  # Build one compact section per session in tmux's window order. list-panes -a
+  # is grouped by session and window index, while the seen map ensures a
+  # multi-pane window contributes only one entry.
+  local summary entry
+  for session in "${!SESSION_KNOWN[@]}"; do
+    summary=""
+    for window in ${SESSION_WINDOWS[$session]:-}; do
+      final="${WINDOW_FINAL[$window]:-}"
+      [ -n "$final" ] || continue
+      entry="${SESSION_WINDOW_INDEX[$session:$window]}:$final"
+      summary+="${summary:+ }$entry"
+    done
+    set_session_summary "$session" "${SESSION_CURRENT[$session]:-}" "$summary"
   done
 }
 
