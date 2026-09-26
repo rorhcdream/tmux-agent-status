@@ -29,6 +29,14 @@ OLD_ROLLOUT="$SESSION_DIR/rollout-2026-01-01T01-00-00-old.jsonl"
 NEW_ROLLOUT="$SESSION_DIR/rollout-2026-01-01T02-00-00-new.jsonl"
 LONG_ROLLOUT="$SESSION_DIR/rollout-2026-01-01T03-00-00-long.jsonl"
 PARTIAL_ROLLOUT="$SESSION_DIR/rollout-2026-01-01T04-00-00-partial.jsonl"
+SHARED_ROOT="$SESSION_DIR/rollout-2026-01-01T05-00-00-shared-root.jsonl"
+SHARED_CHILD="$SESSION_DIR/rollout-2026-01-01T05-01-00-shared-child.jsonl"
+OTHER_ROOT="$SESSION_DIR/rollout-2026-01-01T05-02-00-other-root.jsonl"
+LEGACY_ROOT="$SESSION_DIR/rollout-2026-01-01T05-03-00-legacy-root.jsonl"
+PARTIAL_META="$SESSION_DIR/rollout-2026-01-01T05-04-00-partial-meta.jsonl"
+SAME_CWD_ROOT="$SESSION_DIR/rollout-2026-01-01T05-05-00-same-cwd-root.jsonl"
+UNLINKED_SUBAGENT="$SESSION_DIR/rollout-2026-01-01T05-06-00-unlinked-subagent.jsonl"
+LINKED_SUBAGENT="$SESSION_DIR/rollout-2026-01-01T05-07-00-linked-subagent.jsonl"
 
 printf '%s\n' \
   '{"timestamp":"2026-01-01T01:00:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}' \
@@ -36,19 +44,146 @@ printf '%s\n' \
 printf '%s\n' \
   '{"timestamp":"2026-01-01T02:00:00.000Z","type":"event_msg","payload":{"type":"task_started"}}' \
   >"$NEW_ROLLOUT"
+printf '%s\n' \
+  '{"type":"session_meta","payload":{"id":"root-a","session_id":"root-a","cwd":"/task/a","source":"cli","thread_source":"user"}}' \
+  '{"timestamp":"2026-01-01T05:00:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}' \
+  >"$SHARED_ROOT"
+printf '%s\n' \
+  '{"type":"session_meta","payload":{"id":"child-a","session_id":"root-a","parent_thread_id":"root-a","cwd":"/task/a"}}' \
+  '{"timestamp":"2026-01-01T05:01:00.000Z","type":"event_msg","payload":{"type":"task_started"}}' \
+  >"$SHARED_CHILD"
+printf '%s\n' \
+  '{"type":"session_meta","payload":{"id":"root-b","session_id":"root-b","cwd":"/task/b"}}' \
+  '{"timestamp":"2026-01-01T05:02:00.000Z","type":"event_msg","payload":{"type":"task_started"}}' \
+  >"$OTHER_ROOT"
+printf '%s\n' \
+  '{"type":"session_meta","payload":{"id":"legacy-root","cwd":"/task/legacy"}}' \
+  '{"timestamp":"2026-01-01T05:03:00.000Z","type":"event_msg","payload":{"type":"task_started"}}' \
+  >"$LEGACY_ROOT"
+printf '%s\n' \
+  '{"type":"session_meta","payload":{"id":"root-c","session_id":"root-c","cwd":"/task/a"}}' \
+  '{"timestamp":"2026-01-01T05:05:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}' \
+  >"$SAME_CWD_ROOT"
+printf '%s\n' \
+  '{"type":"session_meta","payload":{"id":"unknown-child","cwd":"/task/a","thread_source":"subagent","source":{"subagent":{"other":"guardian"}}}}' \
+  '{"timestamp":"2026-01-01T05:06:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}' \
+  >"$UNLINKED_SUBAGENT"
+printf '%s\n' \
+  '{"type":"session_meta","payload":{"id":"linked-child","cwd":"/task/a","thread_source":"subagent","source":{"subagent":{"thread_spawn":{"parent_thread_id":"root-a"}}}}}' \
+  '{"timestamp":"2026-01-01T05:07:00.000Z","type":"event_msg","payload":{"type":"task_started"}}' \
+  >"$LINKED_SUBAGENT"
+printf '%s\n' '{"type":"session_meta","payload":' >"$PARTIAL_META"
+
+codex_metadata_for_file "$PARTIAL_META"
+assert_eq '' "${CODEX_META_KNOWN_OF[$PARTIAL_META]:-}" \
+  'incomplete session metadata should be retried on a later poll'
+printf '%s\n' \
+  '{"type":"session_meta","payload":{"id":"late-root","cwd":"/task/late"}}' \
+  >>"$PARTIAL_META"
+codex_metadata_for_file "$PARTIAL_META"
+assert_eq late-root "${CODEX_ID_OF[$PARTIAL_META]:-}" \
+  'completed session metadata should be discovered after an incomplete read'
 
 OPEN_ROLLOUTS="$OLD_ROLLOUT"
 
 # One lsof snapshot should map rollout handles for every Codex process.
 lsof() {
-  printf 'p42\nfcwd\nn%s\nn/tmp/not-a-rollout\np43\nn%s\n' \
-    "$OLD_ROLLOUT" "$NEW_ROLLOUT"
+  printf 'p42\nfcwd\nn%s\nn/tmp/not-a-rollout\np43\nn%s\np900\nn%s\nn%s\nn%s\n' \
+    "$OLD_ROLLOUT" "$NEW_ROLLOUT" "$SHARED_ROOT" "$SHARED_CHILD" "$OTHER_ROOT"
 }
 HAS_CODEX_PROCESS=1
 snapshot_codex_files
 assert_eq "$OLD_ROLLOUT" "${CODEX_OPEN_FILES_OF[42]:-}" 'lsof snapshot should map the first Codex rollout'
 assert_eq "$NEW_ROLLOUT" "${CODEX_OPEN_FILES_OF[43]:-}" 'lsof snapshot should map the second Codex rollout'
 unset -f lsof
+
+# Shared app-server rollouts must fall back to cwd and stay scoped to the root
+# session, including its child threads but excluding another cwd's busy root.
+readlink() {
+  case "$1" in
+    /proc/77/cwd|/proc/79/cwd|/proc/80/cwd|/proc/82/cwd) printf '/task/a\n' ;;
+    *) return 1 ;;
+  esac
+}
+status=""; timestamp=0
+status_for_codex_pid 77 status timestamp
+assert_eq busy "$status" 'shared app-server child activity should map back to its pane cwd'
+assert_eq "$SHARED_ROOT"$'\n'"$SHARED_CHILD" "${CODEX_FILES_OF[77]:-}" \
+  'shared fallback should include only the matching root session and children'
+
+# The source field can be a string for roots and an object for subagents.
+# An unlinked subagent cannot identify a root; a thread_spawn parent can.
+CODEX_ALL_OPEN_FILES+=$'\n'"$UNLINKED_SUBAGENT"$'\n'"$LINKED_SUBAGENT"
+status_for_codex_pid 77 status timestamp
+assert_eq "$SHARED_ROOT"$'\n'"$SHARED_CHILD"$'\n'"$LINKED_SUBAGENT" \
+  "${CODEX_FILES_OF[77]:-}" 'subagent metadata should not create a false root group'
+CODEX_ALL_OPEN_FILES="$SHARED_ROOT"$'\n'"$SHARED_CHILD"$'\n'"$OTHER_ROOT"
+
+# A closed child handle must not erase its last known working state.
+CODEX_ALL_OPEN_FILES="$SHARED_ROOT"$'\n'"$OTHER_ROOT"
+status_for_codex_pid 77 status timestamp
+assert_eq busy "$status" 'cached child status should survive its handle closing'
+assert_eq "$SHARED_ROOT"$'\n'"$SHARED_CHILD"$'\n'"$LINKED_SUBAGENT" "${CODEX_FILES_OF[77]:-}" \
+  'cached child should remain associated with the root'
+
+# Other sessions can keep handles open after every file for this pane closes.
+CODEX_ALL_OPEN_FILES="$OTHER_ROOT"
+status_for_codex_pid 77 status timestamp
+assert_eq busy "$status" 'unrelated open rollouts should not clear a cached session'
+CODEX_ALL_OPEN_FILES="$SHARED_ROOT"$'\n'"$OTHER_ROOT"
+
+# A child alone still identifies its root session, even if the root handle has
+# closed before this pane was observed.
+CODEX_ALL_OPEN_FILES="$SHARED_CHILD"$'\n'"$OTHER_ROOT"
+status=""; timestamp=0
+status_for_codex_pid 79 status timestamp
+assert_eq busy "$status" 'open child should map without an open root handle'
+assert_eq "$SHARED_CHILD" "${CODEX_FILES_OF[79]:-}" \
+  'child-only discovery should select its root session'
+
+# Two pane-local clients in one directory cannot safely be mapped by cwd alone.
+PANE_CODEX_PID[77]=1
+PANE_CODEX_PID[80]=1
+status=""; timestamp=0
+status_for_codex_pid 80 status timestamp
+assert_eq '' "$status" 'ambiguous same-cwd clients should not borrow status'
+unset 'PANE_CODEX_PID[77]' 'PANE_CODEX_PID[80]'
+CODEX_ALL_OPEN_FILES="$SHARED_ROOT"$'\n'"$SHARED_CHILD"$'\n'"$OTHER_ROOT"
+
+# A new root in the same directory invalidates a previous cwd association.
+CODEX_ALL_OPEN_FILES+=$'\n'"$SAME_CWD_ROOT"
+status=""; timestamp=0
+status_for_codex_pid 77 status timestamp
+assert_eq '' "$status" 'two open roots in one cwd should clear the cached status'
+assert_eq '' "${CODEX_FILES_OF[77]:-}" 'ambiguous root should clear cached rollouts'
+
+# A pane-local process holding its own rollout must not donate it to another
+# pane's shared-server fallback.
+CODEX_ALL_OPEN_FILES="$SAME_CWD_ROOT"
+CODEX_OPEN_OWNER_OF["$SAME_CWD_ROOT"]=81
+PANE_CODEX_PID[81]=1
+status=""; timestamp=0
+status_for_codex_pid 82 status timestamp
+assert_eq '' "$status" 'shared fallback should exclude another pane client rollout'
+unset 'PANE_CODEX_PID[81]' 'CODEX_OPEN_OWNER_OF[$SAME_CWD_ROOT]'
+CODEX_ALL_OPEN_FILES="$SHARED_ROOT"$'\n'"$SHARED_CHILD"$'\n'"$OTHER_ROOT"
+
+# BSD/macOS has no /proc process cwd link. Exercise the lsof fallback with a
+# root from older Codex metadata that has an id but no session_id.
+readlink() { return 1; }
+lsof() {
+  if [ "${1:-}" = -a ] && [ "${2:-}" = -p ] && [ "${4:-}" = -d ]; then
+    printf 'p%s\nfcwd\nn/task/legacy\n' "$3"
+  fi
+}
+assert_eq /task/legacy "$(codex_cwd_for_pid 78)" 'lsof should supply the cwd when /proc is unavailable'
+CODEX_ALL_OPEN_FILES+=$'\n'"$LEGACY_ROOT"
+status=""; timestamp=0
+status_for_codex_pid 78 status timestamp
+assert_eq busy "$status" 'legacy root without session_id should contribute its status'
+assert_eq "$LEGACY_ROOT" "${CODEX_FILES_OF[78]:-}" \
+  'legacy root without session_id should remain in the selected file set'
+unset -f readlink lsof
 
 status_for_test_pid() {
   CODEX_OPEN_FILES_OF["$1"]="$OPEN_ROLLOUTS"

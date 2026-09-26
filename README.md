@@ -36,10 +36,15 @@ and no false positives on long, quiet generations.
 
 Codex has no per-pid status file — it writes an append-only event log per session
 (`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`). The daemon bridges a running
-`codex` process to the rollout files it holds open with `lsof` (a resumed or
-multi-agent process can retain several), aggregates them with working taking
-precedence over done, then caches that set so it survives handles closing between
-turns. It derives each rollout's status from the last turn-boundary event:
+`codex` process to rollout files with `lsof`. Newer Codex clients delegate those
+handles to a shared app-server; for them the daemon matches the pane process's
+working directory to an unambiguous root session and includes that root's
+subthreads. If multiple pane clients or root sessions share a directory without
+another identifying link, their status remains blank rather than being assigned
+to the wrong pane. A resumed or multi-agent session can retain several files, so the
+daemon aggregates them with working taking precedence over done, then caches the
+set so it survives handles closing between turns. It derives each rollout's status
+from the last turn-boundary event:
 `task_started` → working, `task_complete` → done, `turn_aborted` → cleared.
 Everything downstream (icons, sticky-done, recency) is shared with the Claude path,
 so a codex pane looks identical.

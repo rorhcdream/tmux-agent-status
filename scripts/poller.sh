@@ -89,11 +89,13 @@ tm() {
 # Exit cleanly if the tmux server goes away.
 server_alive() { tm has-session >/dev/null 2>&1 || tm list-panes -a >/dev/null 2>&1; }
 
-file_mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null; }
+file_mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null; }
 
 declare -A PPID_OF       # pid -> ppid
 declare -A COMM_OF       # pid -> basename(comm)
 declare -A CHILDREN_OF   # ppid -> space-separated child pids
+declare -A PANE_CODEX_PID # codex pids discovered below a tmux pane
+declare -A CODEX_CWD_OF_PID # codex pid -> cwd ("-" if unknown), per process snapshot
 HAS_CODEX_PROCESS=0
 PROCESS_SNAPSHOT_AT_US=0
 CODEX_SNAPSHOT_AT_US=0
@@ -144,6 +146,20 @@ find_agent_pids() {
   done
   printf -v "$output_var" '%s' "$result"
   return "$found"
+}
+
+snapshot_pane_codex_pids() {
+  local pane_snapshot="$1" pane window session index pane_pid rest agent_pids apid akind
+  PANE_CODEX_PID=()
+  while IFS=$'\t' read -r pane window session index pane_pid rest; do
+    [ -n "${pane_pid:-}" ] || continue
+    agent_pids=""
+    find_agent_pids "$pane_pid" agent_pids || true
+    while IFS=$'\t' read -r apid akind; do
+      [ "$akind" = codex ] && PANE_CODEX_PID["$apid"]=1
+    done <<< "$agent_pids"
+  done <<< "$pane_snapshot"
+  return 0
 }
 
 # Returns status and ts_ms for a Claude pid; ts falls back to file mtime.
@@ -212,20 +228,31 @@ declare -A CODEX_STATUS_OF   # rollout path -> last derived status
 declare -A CODEX_TS_OF       # rollout path -> last boundary timestamp
 declare -A CODEX_SIZE_OF     # rollout path -> size after last parse
 declare -A CODEX_OPEN_FILES_OF # codex pid -> rollouts open this poll
+declare -A CODEX_OPEN_OWNER_OF # rollout path -> pid holding it open
 declare -A CODEX_SIZE_SNAPSHOT_OF # rollout path -> size in this poll
+CODEX_ALL_OPEN_FILES=""      # unique rollouts held by any Codex process
+declare -A CODEX_META_KNOWN_OF # rollout path -> 1 once session metadata was read
+declare -A CODEX_CWD_OF       # rollout path -> session working directory
+declare -A CODEX_ID_OF        # rollout path -> thread id
+declare -A CODEX_SESSION_OF   # rollout path -> root session id
+declare -A CODEX_PARENT_OF    # rollout path -> parent thread id (empty for root)
+declare -A CODEX_SUBAGENT_OF  # rollout path -> 1 when source marks a subagent
 
-if stat -f %z "$0" >/dev/null 2>&1; then
-  STAT_SIZE_STYLE=bsd
-else
+if stat -c %s "$0" >/dev/null 2>&1; then
   STAT_SIZE_STYLE=gnu
+else
+  STAT_SIZE_STYLE=bsd
 fi
 
 # Snapshot open rollout handles for every Codex process with one lsof call.
 # Running lsof separately for each pane was the largest avoidable polling cost.
 snapshot_codex_files() {
   CODEX_OPEN_FILES_OF=()
+  CODEX_OPEN_OWNER_OF=()
+  CODEX_ALL_OPEN_FILES=""
   [ "$HAS_CODEX_PROCESS" = 1 ] || return
   local line pid="" candidate
+  local -A seen=()
   while IFS= read -r line; do
     case "$line" in
       p*) pid="${line#p}" ;;
@@ -233,9 +260,128 @@ snapshot_codex_files() {
         candidate="${line#n}"
         [ -n "$pid" ] && [ -f "$candidate" ] || continue
         CODEX_OPEN_FILES_OF["$pid"]+="${CODEX_OPEN_FILES_OF[$pid]:+$'\n'}$candidate"
+        CODEX_OPEN_OWNER_OF["$candidate"]="$pid"
+        if [ -z "${seen[$candidate]:-}" ]; then
+          seen["$candidate"]=1
+          CODEX_ALL_OPEN_FILES+="${CODEX_ALL_OPEN_FILES:+$'\n'}$candidate"
+        fi
         ;;
     esac
   done < <(lsof -a -c codex -Fn 2>/dev/null)
+}
+
+# Cached per process snapshot: the shared fallback runs every poll and compares
+# every pane client's cwd, which would otherwise fork (lsof on macOS) n^2 times.
+codex_cached_cwd_for_pid() {
+  # codex_cached_cwd_for_pid <pid> <output-variable>
+  local _cached_cwd="${CODEX_CWD_OF_PID[$1]:-}"
+  if [ -z "$_cached_cwd" ]; then
+    _cached_cwd="$(codex_cwd_for_pid "$1")"
+    CODEX_CWD_OF_PID["$1"]="${_cached_cwd:--}"
+  fi
+  [ "$_cached_cwd" = - ] && _cached_cwd=""
+  printf -v "$2" '%s' "$_cached_cwd"
+}
+
+codex_cwd_for_pid() {
+  local cwd
+  cwd="$(readlink "/proc/$1/cwd" 2>/dev/null)"
+  if [ -n "$cwd" ]; then
+    printf '%s\n' "$cwd"
+    return
+  fi
+  # macOS has no /proc. lsof reports the process's cwd as an n-prefixed path.
+  lsof -a -p "$1" -d cwd -Fn 2>/dev/null | sed -n 's/^n\(\/.*\)$/\1/p' | head -n 1
+}
+
+codex_metadata_for_file() {
+  local codex_file="$1" out
+  [ -n "${CODEX_META_KNOWN_OF[$codex_file]:-}" ] && return
+  out="$(head -n 32 "$codex_file" 2>/dev/null | jq -Rrn '
+    first(inputs | fromjson? | select(.type == "session_meta") | .payload) as $m
+    | if $m == null then empty
+      else [($m.cwd // "-"), ($m.id // "-"), ($m.session_id // "-"),
+            ($m.parent_thread_id // (try $m.source.subagent.thread_spawn.parent_thread_id catch null) // "-"),
+            (if $m.thread_source == "subagent" or (try $m.source.subagent catch null) != null
+             then "1" else "0" end)] | @tsv
+      end' 2>/dev/null)"
+  # A newly opened rollout may be observed before session_meta is complete.
+  # Leave it uncached so the next snapshot can parse the finished record.
+  [ -n "$out" ] || return 0
+  CODEX_META_KNOWN_OF["$codex_file"]=1
+  IFS=$'\t' read -r CODEX_CWD_OF["$codex_file"] \
+    CODEX_ID_OF["$codex_file"] CODEX_SESSION_OF["$codex_file"] \
+    CODEX_PARENT_OF["$codex_file"] CODEX_SUBAGENT_OF["$codex_file"] <<< "$out"
+  [ "${CODEX_CWD_OF[$codex_file]}" = - ] && CODEX_CWD_OF["$codex_file"]=""
+  [ "${CODEX_ID_OF[$codex_file]}" = - ] && CODEX_ID_OF["$codex_file"]=""
+  [ "${CODEX_SESSION_OF[$codex_file]}" = - ] && CODEX_SESSION_OF["$codex_file"]=""
+  [ "${CODEX_PARENT_OF[$codex_file]}" = - ] && CODEX_PARENT_OF["$codex_file"]=""
+  return 0
+}
+
+codex_file_owned_by_pane_client() {
+  local owner="${CODEX_OPEN_OWNER_OF[$1]:-}"
+  [ -n "$owner" ] && [ -n "${PANE_CODEX_PID[$owner]:-}" ]
+}
+
+# Newer Codex clients can delegate every rollout handle to one shared app-server
+# daemon. In that mode the pane-local pid has no direct lsof match. Match cwd and
+# root session identity; if either identifies multiple unassigned clients or
+# sessions, leave them unassigned rather than displaying another pane's status.
+codex_shared_files_for_pid() {
+  # codex_shared_files_for_pid <pid> <output-variable>
+  local pid="$1" output_var="$2" cwd candidate root_id="" group="" other_pid
+  local client_count=0 result="" cached="${CODEX_FILES_OF[$pid]:-}" other_cwd
+  local -A groups=() seen=()
+  codex_cached_cwd_for_pid "$pid" cwd
+  if [ -z "$cwd" ] || [ -z "$CODEX_ALL_OPEN_FILES" ]; then
+    printf -v "$output_var" ''
+    return 1
+  fi
+
+  while IFS= read -r candidate; do
+    [ -f "$candidate" ] || continue
+    codex_file_owned_by_pane_client "$candidate" && continue
+    codex_metadata_for_file "$candidate"
+    [ "${CODEX_CWD_OF[$candidate]:-}" = "$cwd" ] || continue
+    group="${CODEX_SESSION_OF[$candidate]:-}"
+    [ -n "$group" ] || { [ "${CODEX_SUBAGENT_OF[$candidate]:-}" != 1 ] \
+      && group="${CODEX_ID_OF[$candidate]:-}"; }
+    [ -n "$group" ] && groups["$group"]=1
+  done <<< "$CODEX_ALL_OPEN_FILES"
+
+  if [ "${#groups[@]}" -eq 0 ]; then
+    printf -v "$output_var" ''
+    return 1
+  fi
+  [ "${#groups[@]}" -eq 1 ] || { printf -v "$output_var" ''; return 2; }
+  for group in "${!groups[@]}"; do root_id="$group"; done
+  # More than one pane-local Codex client in this cwd is ambiguous even if
+  # the shared server currently has only one rollout group open.
+  for other_pid in "${!PANE_CODEX_PID[@]}"; do
+    [ -n "${CODEX_OPEN_FILES_OF[$other_pid]:-}" ] && continue
+    codex_cached_cwd_for_pid "$other_pid" other_cwd
+    [ "$other_cwd" = "$cwd" ] || continue
+    client_count=$((client_count + 1))
+    [ "$client_count" -le 1 ] || { printf -v "$output_var" ''; return 2; }
+  done
+
+  # Keep previously associated children when their handles close between
+  # snapshots, as long as the file still belongs to this root session.
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] && [ -f "$candidate" ] || continue
+    [ -z "${seen[$candidate]:-}" ] || continue
+    codex_file_owned_by_pane_client "$candidate" && continue
+    codex_metadata_for_file "$candidate"
+    [ "${CODEX_SESSION_OF[$candidate]:-}" = "$root_id" ] \
+      || [ "${CODEX_PARENT_OF[$candidate]:-}" = "$root_id" ] \
+      || { [ "${CODEX_SUBAGENT_OF[$candidate]:-}" != 1 ] \
+        && [ "${CODEX_ID_OF[$candidate]:-}" = "$root_id" ]; } || continue
+    seen["$candidate"]=1
+    result+="${result:+$'\n'}$candidate"
+  done <<< "$CODEX_ALL_OPEN_FILES"$'\n'"$cached"
+  printf -v "$output_var" '%s' "$result"
+  [ -n "$result" ]
 }
 
 # Query all known rollout sizes with one stat process. A separate stat per file
@@ -273,7 +419,7 @@ codex_files_for_pid() {
   # codex_files_for_pid <pid> <output-variable>
   local pid="$1" output_var="$2"
   local cached="${CODEX_FILES_OF[$pid]:-}" candidate
-  local files="${CODEX_OPEN_FILES_OF[$pid]:-}" valid_cached=""
+  local files="${CODEX_OPEN_FILES_OF[$pid]:-}" valid_cached="" shared_result=0
 
   # Use the consolidated per-poll snapshot so newly opened/resumed rollouts
   # join the aggregate without spawning lsof once per Codex process.
@@ -286,6 +432,20 @@ codex_files_for_pid() {
     CODEX_FILES_OF["$pid"]="$files"
     printf -v "$output_var" '%s' "$files"
     return 0
+  fi
+
+  # Shared app-server fallback. Recompute this on every lsof snapshot so a new
+  # or resumed root session in the same working directory replaces stale state.
+  codex_shared_files_for_pid "$pid" files || shared_result=$?
+  if [ -n "$files" ]; then
+    CODEX_FILES_OF["$pid"]="$files"
+    printf -v "$output_var" '%s' "$files"
+    return 0
+  fi
+  if [ "$shared_result" -eq 2 ]; then
+    unset 'CODEX_FILES_OF[$pid]'
+    printf -v "$output_var" ''
+    return 1
   fi
 
   # Codex may close rollout handles briefly between turns. Preserve all cached
@@ -313,7 +473,11 @@ status_for_codex_file() {
   local out ev tsms st="" seeded="${CODEX_KNOWN_OF[$codex_file]:-}"
   local size="${CODEX_SIZE_SNAPSHOT_OF[$codex_file]:-}"
   if [ -z "$size" ]; then
-    size="$(stat -f %z "$codex_file" 2>/dev/null || stat -c %s "$codex_file" 2>/dev/null)"
+    if [ "$STAT_SIZE_STYLE" = bsd ]; then
+      size="$(stat -f %z "$codex_file" 2>/dev/null)"
+    else
+      size="$(stat -c %s "$codex_file" 2>/dev/null)"
+    fi
   fi
   case "$size" in ''|*[!0-9]*) size=0 ;; esac
 
@@ -480,6 +644,8 @@ reconcile() {
     PROCESS_SNAPSHOT_AT_US=$(( 10#$poll_now_us ))
     PANE_PROCESS_FINGERPRINT="$pane_fingerprint"
     process_refreshed=1
+    snapshot_pane_codex_pids "$pane_snapshot"
+    CODEX_CWD_OF_PID=()
   fi
 
   # Known rollout contents are still checked every poll. Handle discovery is
