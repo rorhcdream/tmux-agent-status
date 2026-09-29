@@ -191,6 +191,7 @@ session.
 
 ```sh
 bash tests/poller_test.sh
+bash tests/startup_test.sh
 ```
 
 ## Caveats

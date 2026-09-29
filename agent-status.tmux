@@ -154,7 +154,10 @@ fi
 # Launch the daemon detached. Pass the tmux socket so it targets this server
 # even after tmux's env is gone. setsid if available so it survives the config
 # reload that spawned it.
-SOCKET="${TMUX%%,*}" # $TMUX = <socket>,<pid>,<session>
+# A fresh server can load TPM before any pane has supplied $TMUX. Query the
+# server directly so startup does not abort under `set -u` after a reboot.
+SOCKET="$(tmux display-message -p '#{socket_path}')"
+[ -n "$SOCKET" ] || { printf 'agent-status: cannot determine tmux socket\n' >&2; exit 1; }
 
 run_daemon() {
   AGENT_STATUS_SOCKET="$SOCKET" \
