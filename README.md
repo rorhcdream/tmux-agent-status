@@ -32,6 +32,13 @@ each Claude PID back to its tmux pane (pane → `pane_pid` → child `claude` pr
 and sets a tmux status option accordingly. Reading ground truth means no stuck icons
 and no false positives on long, quiet generations.
 
+For `claude attach <job-id>`, the pane runs an attach client while the daemon
+worker writes the session status. The poller matches the client's job ID to a
+live worker's `jobId` across the scanned config directories. It checks again
+each poll to handle worker restarts and newly created files. Dead workers and
+ambiguous matches are ignored; on Linux, recorded process start ticks also
+guard against stale files from reused PIDs.
+
 ### Codex
 
 Codex has no per-pid status file — it writes an append-only event log per session
@@ -198,6 +205,7 @@ session.
 
 ```sh
 bash tests/poller_test.sh
+bash tests/claude_daemon_test.sh
 bash tests/startup_test.sh
 ```
 

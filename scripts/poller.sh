@@ -94,6 +94,7 @@ file_mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null; }
 declare -A PPID_OF       # pid -> ppid
 declare -A COMM_OF       # pid -> basename(comm)
 declare -A CHILDREN_OF   # ppid -> space-separated child pids
+declare -A CLAUDE_JOB_OF_PID # pane-local attach client pid -> daemon job id
 declare -A PANE_CODEX_PID # codex pids discovered below a tmux pane
 declare -A CODEX_CWD_OF_PID # codex pid -> cwd ("-" if unknown), per process snapshot
 HAS_CODEX_PROCESS=0
@@ -104,15 +105,19 @@ PROCESS_SNAPSHOT_TTL_US=5000000 # safety rescan; pane command changes are immedi
 CODEX_SNAPSHOT_TTL_US=2000000   # catches resumed pre-existing rollouts
 
 snapshot_processes() {
-  PPID_OF=(); COMM_OF=(); CHILDREN_OF=(); HAS_CODEX_PROCESS=0
-  local pid ppid comm
-  while read -r pid ppid comm; do
+  PPID_OF=(); COMM_OF=(); CHILDREN_OF=(); CLAUDE_JOB_OF_PID=(); HAS_CODEX_PROCESS=0
+  local pid ppid comm args
+  while read -r pid ppid comm args; do
     [ -z "${pid:-}" ] && continue
     PPID_OF["$pid"]="$ppid"
     COMM_OF["$pid"]="${comm##*/}"
     CHILDREN_OF["$ppid"]+="${CHILDREN_OF[$ppid]:+ }$pid"
     [ "${comm##*/}" = codex ] && HAS_CODEX_PROCESS=1
-  done < <(ps -Ao pid=,ppid=,comm= 2>/dev/null)
+    if [ "${comm##*/}" = claude ] \
+      && [[ "$args" =~ ^([^[:space:]]*/)?claude[[:space:]]+attach[[:space:]]+([a-zA-Z0-9_-]+)([[:space:]]|$) ]]; then
+      CLAUDE_JOB_OF_PID["$pid"]="${BASH_REMATCH[2]}"
+    fi
+  done < <(ps -Ao pid=,ppid=,comm=,args= 2>/dev/null)
 }
 
 # Find ALL `claude`/`codex` processes at or beneath the given pid (BFS,
@@ -169,27 +174,76 @@ declare -A CLAUDE_FILE_OF     # claude pid -> selected session file
 declare -A CLAUDE_CONTENT_OF  # session file -> exact content at last parse
 declare -A CLAUDE_STATUS_OF   # session file -> last parsed status
 declare -A CLAUDE_TS_OF       # session file -> last parsed timestamp
+declare -A CLAUDE_FILE_OF_JOB # job id -> live worker file ("-" if ambiguous)
+CLAUDE_JOBS_SCANNED=0
+
+# Attach clients have no session file of their own. Index live daemon records
+# lazily, once per poll, so a worker restart or a late-created file is picked up.
+snapshot_claude_jobs() {
+  CLAUDE_FILE_OF_JOB=()
+  CLAUDE_JOBS_SCANNED=1
+  local d candidate worker record job start proc_stat proc_fields
+  for d in $CONFIG_DIRS; do
+    for candidate in "$d"/sessions/*.json; do
+      [ -f "$candidate" ] || continue
+      worker="${candidate##*/}"; worker="${worker%.json}"
+      case "$worker" in ''|*[!0-9]*) continue ;; esac
+      [ "$worker" -gt 0 ] && kill -0 "$worker" 2>/dev/null || continue
+      record="$(jq -r --argjson pid "$worker" '
+        select(.pid == $pid and (.jobId | type) == "string" and .jobId != "")
+        | [.jobId, (.procStart // "-")] | @tsv' "$candidate" 2>/dev/null)" || continue
+      [ -n "$record" ] || continue
+      IFS=$'\t' read -r job start <<< "$record"
+      # Linux exposes process start ticks. Check them when recorded, to reject
+      # leftover files whose pid has since been reused (and zombie workers).
+      if [ -r "/proc/$worker/stat" ]; then
+        proc_stat="$(< "/proc/$worker/stat")"
+        proc_fields="${proc_stat##*) }"
+        local -a fields=()
+        read -r -a fields <<< "$proc_fields"
+        [ "${fields[0]:-}" != Z ] || continue
+        [ "$start" = - ] || [ "$start" = "${fields[19]:-}" ] || continue
+      fi
+      if [ -n "${CLAUDE_FILE_OF_JOB[$job]:-}" ]; then
+        CLAUDE_FILE_OF_JOB["$job"]=-
+      else
+        CLAUDE_FILE_OF_JOB["$job"]="$candidate"
+      fi
+    done
+  done
+}
 
 status_for_pid() {
   # status_for_pid <pid> <status-variable> <timestamp-variable>
   local pid="$1" status_var="$2" timestamp_var="$3"
   local d cand f="" best=0 m
-  f="${CLAUDE_FILE_OF[$pid]:-}"
-  if [ ! -f "$f" ]; then
-    f=""
-    for d in $CONFIG_DIRS; do
-      cand="$d/sessions/$pid.json"
-      [ -f "$cand" ] || continue
-      m="$(file_mtime "$cand")"
-      [ "${m:-0}" -gt "$best" ] 2>/dev/null && { best="$m"; f="$cand"; }
-    done
-    if [ -n "$f" ]; then
-      CLAUDE_FILE_OF["$pid"]="$f"
-    else
-      unset 'CLAUDE_FILE_OF[$pid]'
+  local job="${CLAUDE_JOB_OF_PID[$pid]:-}"
+  if [ -n "$job" ]; then
+    [ "$CLAUDE_JOBS_SCANNED" = 1 ] || snapshot_claude_jobs
+    f="${CLAUDE_FILE_OF_JOB[$job]:-}"
+    if [ ! -f "$f" ]; then
       printf -v "$status_var" ''
       printf -v "$timestamp_var" '0'
       return
+    fi
+  else
+    f="${CLAUDE_FILE_OF[$pid]:-}"
+    if [ ! -f "$f" ]; then
+      f=""
+      for d in $CONFIG_DIRS; do
+        cand="$d/sessions/$pid.json"
+        [ -f "$cand" ] || continue
+        m="$(file_mtime "$cand")"
+        [ "${m:-0}" -gt "$best" ] 2>/dev/null && { best="$m"; f="$cand"; }
+      done
+      if [ -n "$f" ]; then
+        CLAUDE_FILE_OF["$pid"]="$f"
+      else
+        unset 'CLAUDE_FILE_OF[$pid]'
+        printf -v "$status_var" ''
+        printf -v "$timestamp_var" '0'
+        return
+      fi
     fi
   fi
 
@@ -663,6 +717,7 @@ codex_approval_pending() {
 }
 
 reconcile() {
+  CLAUDE_JOBS_SCANNED=0
   local pane_snapshot pane_format pane_fingerprint=""
   local fp_pane fp_window fp_session fp_index fp_pid fp_pane_active fp_window_active
   local fp_current fp_ts fp_seen fp_popup fp_summary fp_command
