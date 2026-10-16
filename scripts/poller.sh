@@ -521,8 +521,9 @@ codex_files_for_pid() {
 }
 
 # A rollout's status is derived from turn boundaries plus Codex user-input
-# requests. A question stays waiting through task_complete until the next user
-# message; turn_aborted clears it. ts comes from the event that changed status.
+# requests. A user reply or turn completion clears outstanding questions: an
+# optional async question must not keep a completed run waiting forever.
+# ts comes from the event that changed status.
 status_for_codex_file() {
   # status_for_codex_file <file> <status-variable> <timestamp-variable>
   local codex_file="$1" status_var="$2" timestamp_var="$3"
@@ -586,7 +587,7 @@ status_for_codex_file() {
         elif $e.kind == "start" then
           .status = (if .pending == 1 then "waiting" else "busy" end) | .ts = $e.ts
         elif $e.kind == "complete" then
-          .status = (if .pending == 1 then "waiting" else "idle" end) | .ts = $e.ts
+          .pending = 0 | .status = "idle" | .ts = $e.ts
         elif $e.kind == "abort" then
           .pending = 0 | .status = "clear" | .ts = $e.ts
         else .

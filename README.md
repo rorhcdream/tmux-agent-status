@@ -53,8 +53,9 @@ daemon aggregates them with working taking precedence over waiting and done, the
 caches the set so it survives handles closing between turns. It derives each
 rollout's status from turn-boundary and user-input events:
 `task_started` → working, `request_user_input[_async]` → waiting,
-`task_complete` → done unless a question is still unanswered, and
-`turn_aborted` → cleared. The next Codex user message clears waiting.
+`task_complete` → done, and `turn_aborted` → cleared. A Codex user message
+clears waiting during a turn. Completion also clears outstanding questions,
+so an optional unanswered async question cannot keep a finished run waiting.
 Command-approval prompts inside the Codex terminal are detected separately from
 its live pane screen. A visible command prompt with both decision labels shows
 waiting, taking priority over other busy agents in that window. Once the prompt

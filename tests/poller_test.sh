@@ -227,8 +227,8 @@ status_for_test_pid 42 status timestamp
 assert_eq idle "$status" 'all completed rollouts should show the done marker'
 
 # Codex user-input requests are asynchronous: the tool call is accepted
-# immediately, while the actual answer arrives later as a UserMessage. Keep the
-# question visible through task completion, then return to working on reply.
+# immediately, while the actual answer arrives later as a UserMessage. Show the
+# question while the turn is active, then return to working on reply.
 printf '%s\n' \
   '{"timestamp":"2026-01-01T03:10:00.000Z","type":"event_msg","payload":{"type":"task_started"}}' \
   '{"timestamp":"2026-01-01T03:11:00.000Z","type":"response_item","payload":{"type":"function_call","name":"request_user_input_async"}}' \
@@ -236,12 +236,6 @@ printf '%s\n' \
 OPEN_ROLLOUTS="$QUESTION_ROLLOUT"
 status_for_test_pid 45 status timestamp
 assert_eq waiting "$status" 'an outstanding Codex question should show the waiting marker'
-
-printf '%s\n' \
-  '{"timestamp":"2026-01-01T03:12:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}' \
-  >>"$QUESTION_ROLLOUT"
-status_for_test_pid 45 status timestamp
-assert_eq waiting "$status" 'task completion should not hide an unanswered question'
 
 printf '%s\n' \
   '{"timestamp":"2026-01-01T03:13:00.000Z","type":"response_item","payload":{"type":"message","role":"user"}}' \
@@ -255,6 +249,30 @@ printf '%s\n' \
   >>"$QUESTION_ROLLOUT"
 status_for_test_pid 45 status timestamp
 assert_eq idle "$status" 'completion after the answer should show done'
+
+# An optional async question can remain unanswered when the agent finishes.
+# Completion must clear it both in the cached tail and on a fresh history scan.
+printf '%s\n' \
+  '{"timestamp":"2026-01-01T03:15:00.000Z","type":"event_msg","payload":{"type":"task_started"}}' \
+  '{"timestamp":"2026-01-01T03:16:00.000Z","type":"response_item","payload":{"type":"function_call","name":"request_user_input_async"}}' \
+  >>"$QUESTION_ROLLOUT"
+status_for_test_pid 45 status timestamp
+assert_eq waiting "$status" 'a new question should still wait during an active turn'
+printf '%s\n' \
+  '{"timestamp":"2026-01-01T03:17:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}' \
+  >>"$QUESTION_ROLLOUT"
+status_for_test_pid 45 status timestamp
+assert_eq idle "$status" 'completion should clear an unanswered optional question'
+assert_eq 0 "${CODEX_QUESTION_OF[$QUESTION_ROLLOUT]}" 'completion should reset cached question state'
+unset 'CODEX_KNOWN_OF[$QUESTION_ROLLOUT]' 'CODEX_STATUS_OF[$QUESTION_ROLLOUT]' \
+  'CODEX_QUESTION_OF[$QUESTION_ROLLOUT]'
+status_for_test_pid 45 status timestamp
+assert_eq idle "$status" 'a fresh scan should classify a completed unanswered question as done'
+printf '%s\n' \
+  '{"timestamp":"2026-01-01T03:18:00.000Z","type":"event_msg","payload":{"type":"task_started"}}' \
+  >>"$QUESTION_ROLLOUT"
+status_for_test_pid 45 status timestamp
+assert_eq busy "$status" 'the next turn should not inherit an old unanswered question'
 
 # Terminal approvals are detected independently of the rollout, and disappear
 # as soon as the prompt closes. No command text from a real session is needed.
