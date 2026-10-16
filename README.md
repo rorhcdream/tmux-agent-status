@@ -42,10 +42,17 @@ working directory to an unambiguous root session and includes that root's
 subthreads. If multiple pane clients or root sessions share a directory without
 another identifying link, their status remains blank rather than being assigned
 to the wrong pane. A resumed or multi-agent session can retain several files, so the
-daemon aggregates them with working taking precedence over done, then caches the
-set so it survives handles closing between turns. It derives each rollout's status
-from the last turn-boundary event:
-`task_started` → working, `task_complete` → done, `turn_aborted` → cleared.
+daemon aggregates them with working taking precedence over waiting and done, then
+caches the set so it survives handles closing between turns. It derives each
+rollout's status from turn-boundary and user-input events:
+`task_started` → working, `request_user_input[_async]` → waiting,
+`task_complete` → done unless a question is still unanswered, and
+`turn_aborted` → cleared. The next Codex user message clears waiting.
+Command-approval prompts inside the Codex terminal are detected separately from
+its live pane screen. A visible command prompt with both decision labels shows
+waiting, taking priority over other busy agents in that window. Once the prompt
+closes, the icon follows the rollout state again. This does not detect approval
+popups in the desktop app or translated/custom terminal prompt text.
 Everything downstream (icons, sticky-done, recency) is shared with the Claude path,
 so a codex pane looks identical.
 
@@ -58,8 +65,8 @@ so a codex pane looks identical.
 | `idle`          | ✅ done — **sticky** until you view the window once |
 | no agent proc   | (icon cleared)       |
 
-(Codex maps its `task_started` / `task_complete` / `turn_aborted` events onto the
-same working / done / cleared states.)
+(Codex maps its task boundaries and user-input requests onto the same working /
+waiting / done / cleared states.)
 
 ### Sticky "done" (show until checked)
 

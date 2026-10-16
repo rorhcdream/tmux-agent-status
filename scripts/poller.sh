@@ -218,15 +218,17 @@ status_for_pid() {
 # ~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl, named by timestamp and
 # UUID (no pid). We bridge a running codex pid to every rollout file it holds
 # open (lsof). A resumed or multi-agent process can keep several live rollouts,
-# so their states are aggregated with working > done instead of allowing the
-# most recently written completion to hide another running turn. We cache the
-# set per pid so status survives handles closing briefly between turns.
+# so their states are aggregated with working > waiting > done instead of
+# allowing the most recently written completion to hide another running turn.
+# We cache the set per pid so status survives handles closing briefly between
+# turns.
 declare -A CODEX_FILES_OF   # codex pid -> newline-separated rollout paths
 declare -A CODEX_FILE_PID_OF # rollout path -> owning codex pid
 declare -A CODEX_KNOWN_OF    # rollout path -> 1 once its history has been seeded
 declare -A CODEX_STATUS_OF   # rollout path -> last derived status
 declare -A CODEX_TS_OF       # rollout path -> last boundary timestamp
 declare -A CODEX_SIZE_OF     # rollout path -> size after last parse
+declare -A CODEX_QUESTION_OF # rollout path -> 1 while a user question is pending
 declare -A CODEX_OPEN_FILES_OF # codex pid -> rollouts open this poll
 declare -A CODEX_OPEN_OWNER_OF # rollout path -> pid holding it open
 declare -A CODEX_SIZE_SNAPSHOT_OF # rollout path -> size in this poll
@@ -464,13 +466,13 @@ codex_files_for_pid() {
   return 1
 }
 
-# A rollout's status is derived from its last turn-boundary event:
-#   task_started (no later task_complete) -> busy;  task_complete -> idle;
-#   turn_aborted -> cleared. ts comes from the boundary event's ISO timestamp.
+# A rollout's status is derived from turn boundaries plus Codex user-input
+# requests. A question stays waiting through task_complete until the next user
+# message; turn_aborted clears it. ts comes from the event that changed status.
 status_for_codex_file() {
   # status_for_codex_file <file> <status-variable> <timestamp-variable>
   local codex_file="$1" status_var="$2" timestamp_var="$3"
-  local out ev tsms st="" seeded="${CODEX_KNOWN_OF[$codex_file]:-}"
+  local out result rest tsms pending st="" seeded="${CODEX_KNOWN_OF[$codex_file]:-}"
   local size="${CODEX_SIZE_SNAPSHOT_OF[$codex_file]:-}"
   if [ -z "$size" ]; then
     if [ "$STAT_SIZE_STYLE" = bsd ]; then
@@ -492,28 +494,58 @@ status_for_codex_file() {
   # Seed a newly discovered rollout from its full history once. Later polls only
   # inspect a bounded tail; if a long running turn pushes task_started beyond
   # that tail, retain the cached boundary instead of incorrectly going blank.
+  parse_codex_events() {
+    jq -Rrn \
+      --arg initial_status "${CODEX_STATUS_OF[$codex_file]:-}" \
+      --argjson initial_pending "${CODEX_QUESTION_OF[$codex_file]:-0}" '
+      def timestamp_ms($ts):
+        try (($ts | sub("\\.[0-9]+"; "") | fromdateiso8601) * 1000) catch 0;
+      def status_event:
+        (fromjson?) as $e
+        | if $e == null then empty
+          elif $e.type == "event_msg" and $e.payload.type == "task_started" then
+            {kind:"start", ts:timestamp_ms($e.timestamp // "")}
+          elif $e.type == "event_msg" and $e.payload.type == "task_complete" then
+            {kind:"complete", ts:timestamp_ms($e.timestamp // "")}
+          elif $e.type == "event_msg" and $e.payload.type == "turn_aborted" then
+            {kind:"abort", ts:timestamp_ms($e.timestamp // "")}
+          elif $e.type == "response_item" and $e.payload.type == "function_call"
+            and ($e.payload.name == "request_user_input"
+              or $e.payload.name == "request_user_input_async") then
+            {kind:"question", ts:timestamp_ms($e.timestamp // "")}
+          elif ($e.type == "response_item" and $e.payload.type == "message"
+              and $e.payload.role == "user")
+            or ($e.type == "event_msg" and $e.payload.type == "user_message")
+            or ($e.type == "event_msg" and $e.payload.type == "item_completed"
+              and $e.payload.item.type == "UserMessage") then
+            {kind:"answer", ts:timestamp_ms($e.timestamp // "")}
+          else empty
+          end;
+      reduce (inputs | status_event) as $e (
+        {status:$initial_status, pending:$initial_pending, ts:0};
+        if $e.kind == "question" then
+          .pending = 1 | .status = "waiting" | .ts = $e.ts
+        elif $e.kind == "answer" then
+          if .pending == 1 then
+            .pending = 0 | .status = "busy" | .ts = $e.ts
+          else . end
+        elif $e.kind == "start" then
+          .status = (if .pending == 1 then "waiting" else "busy" end) | .ts = $e.ts
+        elif $e.kind == "complete" then
+          .status = (if .pending == 1 then "waiting" else "idle" end) | .ts = $e.ts
+        elif $e.kind == "abort" then
+          .pending = 0 | .status = "clear" | .ts = $e.ts
+        else .
+        end
+      )
+      | if .ts == 0 then empty
+        else .status + "|" + (.ts | tostring) + "|" + (.pending | tostring)
+        end'
+  }
   if [ -z "$seeded" ]; then
-    out="$(jq -Rrn '
-      ([ inputs
-         | fromjson?
-         | {t: (.payload.type // .type // ""), ts: (.timestamp // "")}
-         | select(.t=="task_started" or .t=="task_complete" or .t=="turn_aborted") ]
-       | last) as $e
-      | if $e == null then empty
-        else $e.t + "\t"
-          + ((try (($e.ts | sub("\\.[0-9]+";"") | fromdateiso8601) * 1000) catch 0) | tostring)
-        end' "$codex_file" 2>/dev/null)"
+    out="$(parse_codex_events <"$codex_file" 2>/dev/null)"
   else
-    out="$(tail -n 400 "$codex_file" 2>/dev/null | jq -Rrn '
-      ([ inputs
-         | fromjson?
-         | {t: (.payload.type // .type // ""), ts: (.timestamp // "")}
-         | select(.t=="task_started" or .t=="task_complete" or .t=="turn_aborted") ]
-       | last) as $e
-      | if $e == null then empty
-        else $e.t + "\t"
-          + ((try (($e.ts | sub("\\.[0-9]+";"") | fromdateiso8601) * 1000) catch 0) | tostring)
-        end' 2>/dev/null)"
+    out="$(tail -n 400 "$codex_file" 2>/dev/null | parse_codex_events 2>/dev/null)"
   fi
   if [ -z "$out" ]; then
     CODEX_KNOWN_OF["$codex_file"]=1
@@ -522,18 +554,20 @@ status_for_codex_file() {
     printf -v "$timestamp_var" '%s' "${CODEX_TS_OF[$codex_file]:-0}"
     return
   fi
-  ev="${out%%$'\t'*}"
-  tsms="${out#*$'\t'}"
-  case "$ev" in
-    task_started)  st="busy" ;;
-    task_complete) st="idle" ;;
-    *)             st="" ;;
+  result="${out%%|*}"
+  rest="${out#*|}"
+  tsms="${rest%%|*}"
+  pending="${rest##*|}"
+  case "$result" in
+    busy|waiting|idle) st="$result" ;;
+    *)                 st="" ;;
   esac
   case "$tsms" in ''|0|null) tsms="$(file_mtime "$codex_file")000"; [ "$tsms" = "000" ] && tsms=0 ;; esac
   CODEX_KNOWN_OF["$codex_file"]=1
   CODEX_STATUS_OF["$codex_file"]="$st"
   CODEX_TS_OF["$codex_file"]="$tsms"
   CODEX_SIZE_OF["$codex_file"]="$size"
+  CODEX_QUESTION_OF["$codex_file"]="$pending"
   printf -v "$status_var" '%s' "$st"
   printf -v "$timestamp_var" '%s' "$tsms"
 }
@@ -557,6 +591,7 @@ status_for_codex_pid() {
     status_for_codex_file "$codex_file" file_st file_ts
     case "$file_st" in
       busy|shell) rank=3 ;;
+      waiting)    rank=2 ;;
       idle)       rank=1 ;;
       *)          rank=0 ;;
     esac
@@ -616,6 +651,17 @@ set_session_summary() {
   fi
 }
 
+# Approval prompts are client UI events and need not appear in the rollout.
+# Inspect only the live pane screen, never scrollback or arbitrary log text.
+# Require the command prompt and both decision labels to avoid matching prose.
+codex_approval_pending() {
+  tm capture-pane -p -J -t "$1" 2>/dev/null | awk '
+    index($0, "Would you like to run the following command?") { prompt=1 }
+    index($0, "Yes, proceed") { accept=1 }
+    index($0, "No, and tell Codex what to do differently") { decline=1 }
+    END { exit !(prompt && accept && decline) }'
+}
+
 reconcile() {
   local pane_snapshot pane_format pane_fingerprint=""
   local fp_pane fp_window fp_session fp_index fp_pid fp_pane_active fp_window_active
@@ -673,7 +719,8 @@ reconcile() {
     _p="${CODEX_FILE_PID_OF[$_f]}"
     if [ -z "${PPID_OF[$_p]:-}" ]; then
       unset 'CODEX_FILE_PID_OF[$_f]' 'CODEX_KNOWN_OF[$_f]' \
-        'CODEX_STATUS_OF[$_f]' 'CODEX_TS_OF[$_f]' 'CODEX_SIZE_OF[$_f]'
+        'CODEX_STATUS_OF[$_f]' 'CODEX_TS_OF[$_f]' 'CODEX_SIZE_OF[$_f]' \
+        'CODEX_QUESTION_OF[$_f]'
     fi
   done
 
@@ -687,7 +734,7 @@ reconcile() {
 
   local pane window session window_index pane_pid pane_active win_active current current_ts current_seen popup_count current_summary pane_command
   local st ts base viewing final seen
-  local apid akind ast ats rank current_rank agent_pids
+  local apid akind ast ats rank current_rank agent_pids pane_has_codex
   local -A WINDOW_KNOWN=() WINDOW_CURRENT=() WINDOW_CURRENT_TS=()
   local -A WINDOW_SEEN=() WINDOW_ACTIVE=() WINDOW_POPUP=()
   local -A WINDOW_STATUS=() WINDOW_TS=() WINDOW_RANK=() WINDOW_FINAL=()
@@ -728,11 +775,12 @@ reconcile() {
     # visible if any occurrence is active rather than trusting list order.
     [ "$win_active" = 1 ] && WINDOW_ACTIVE["$window"]=1
 
-    agent_pids=""
+    agent_pids=""; pane_has_codex=0
     find_agent_pids "$pane_pid" agent_pids || true
     while IFS=$'\t' read -r apid akind; do
       [ -z "${apid:-}" ] && continue
       if [ "$akind" = "codex" ]; then
+        pane_has_codex=1
         # Call directly (not through process substitution) so a refreshed
         # pid->rollout cache remains in this shell for later polls.
         ast=""; ats=0
@@ -756,6 +804,14 @@ reconcile() {
         WINDOW_TS["$window"]="${ats:-0}"
       fi
     done <<< "$agent_pids"
+    # A visible approval needs the user even when another rollout or pane is
+    # busy. Rank it above working until the prompt closes, then recompute.
+    if [ "$pane_has_codex" = 1 ] && codex_approval_pending "$pane"; then
+      WINDOW_RANK["$window"]=4
+      WINDOW_STATUS["$window"]=waiting
+      [ "${WINDOW_TS[$window]}" -gt 0 ] \
+        || WINDOW_TS["$window"]="${WINDOW_CURRENT_TS[$window]:-0}"
+    fi
   done <<< "$pane_snapshot"
 
   # Apply sticky-done and publish status exactly once for each window.

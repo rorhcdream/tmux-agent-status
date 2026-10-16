@@ -29,6 +29,7 @@ OLD_ROLLOUT="$SESSION_DIR/rollout-2026-01-01T01-00-00-old.jsonl"
 NEW_ROLLOUT="$SESSION_DIR/rollout-2026-01-01T02-00-00-new.jsonl"
 LONG_ROLLOUT="$SESSION_DIR/rollout-2026-01-01T03-00-00-long.jsonl"
 PARTIAL_ROLLOUT="$SESSION_DIR/rollout-2026-01-01T04-00-00-partial.jsonl"
+QUESTION_ROLLOUT="$SESSION_DIR/rollout-2026-01-01T04-30-00-question.jsonl"
 SHARED_ROOT="$SESSION_DIR/rollout-2026-01-01T05-00-00-shared-root.jsonl"
 SHARED_CHILD="$SESSION_DIR/rollout-2026-01-01T05-01-00-shared-child.jsonl"
 OTHER_ROOT="$SESSION_DIR/rollout-2026-01-01T05-02-00-other-root.jsonl"
@@ -225,6 +226,55 @@ printf '%s\n' \
 status_for_test_pid 42 status timestamp
 assert_eq idle "$status" 'all completed rollouts should show the done marker'
 
+# Codex user-input requests are asynchronous: the tool call is accepted
+# immediately, while the actual answer arrives later as a UserMessage. Keep the
+# question visible through task completion, then return to working on reply.
+printf '%s\n' \
+  '{"timestamp":"2026-01-01T03:10:00.000Z","type":"event_msg","payload":{"type":"task_started"}}' \
+  '{"timestamp":"2026-01-01T03:11:00.000Z","type":"response_item","payload":{"type":"function_call","name":"request_user_input_async"}}' \
+  >"$QUESTION_ROLLOUT"
+OPEN_ROLLOUTS="$QUESTION_ROLLOUT"
+status_for_test_pid 45 status timestamp
+assert_eq waiting "$status" 'an outstanding Codex question should show the waiting marker'
+
+printf '%s\n' \
+  '{"timestamp":"2026-01-01T03:12:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}' \
+  >>"$QUESTION_ROLLOUT"
+status_for_test_pid 45 status timestamp
+assert_eq waiting "$status" 'task completion should not hide an unanswered question'
+
+printf '%s\n' \
+  '{"timestamp":"2026-01-01T03:13:00.000Z","type":"response_item","payload":{"type":"message","role":"user"}}' \
+  '{"timestamp":"2026-01-01T03:13:00.000Z","type":"event_msg","payload":{"type":"user_message"}}' \
+  >>"$QUESTION_ROLLOUT"
+status_for_test_pid 45 status timestamp
+assert_eq busy "$status" 'a user answer should clear waiting and restore working'
+
+printf '%s\n' \
+  '{"timestamp":"2026-01-01T03:14:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}' \
+  >>"$QUESTION_ROLLOUT"
+status_for_test_pid 45 status timestamp
+assert_eq idle "$status" 'completion after the answer should show done'
+
+# Terminal approvals are detected independently of the rollout, and disappear
+# as soon as the prompt closes. No command text from a real session is needed.
+APPROVAL_SCREEN='Would you like to run the following command?
+  $ echo example
+  1. Yes, proceed (y)
+  2. No, and tell Codex what to do differently (esc)'
+MOCK_CAPTURE="$APPROVAL_SCREEN"
+tm() { [ "$1" = capture-pane ] && printf '%s\n' "$MOCK_CAPTURE"; }
+codex_approval_pending %1 || fail 'command approval prompt should be detected'
+MOCK_CAPTURE='Would you like to run the following command?'
+if codex_approval_pending %1; then fail 'a heading alone is not an approval menu'; fi
+MOCK_CAPTURE='Yes, proceed
+No, and tell Codex what to do differently'
+if codex_approval_pending %1; then fail 'decision labels alone are not an approval menu'; fi
+MOCK_CAPTURE='Working on the command'
+if codex_approval_pending %1; then fail 'working output must not retain approval state'; fi
+tm() { return 1; }
+if codex_approval_pending %1; then fail 'capture failure must not report approval'; fi
+
 icon=""
 base_icon_for_status busy 1 0 100 icon
 assert_eq "$ICON_WORKING" "$icon" 'viewing must not clear working'
@@ -379,6 +429,31 @@ assert_eq 1 "$STATUS_WRITES" 'empty sibling pane must not clear or rewrite the i
 assert_eq 1 "$TIMESTAMP_WRITES" 'unchanged agent timestamp should not be rewritten'
 assert_eq 1 "$SUMMARY_WRITES" 'unchanged session summary should not be rewritten'
 
+# A visible approval overrides a busy rollout, including its session summary.
+eval "$(declare -f tm | sed '1s/^tm /tm_without_approval /')"
+# Keep a second Codex pane busy to ensure window aggregation cannot hide approval.
+eval "$(declare -f snapshot_processes | sed '1s/^snapshot_processes /snapshot_without_approval /')"
+snapshot_processes() {
+  snapshot_without_approval
+  COMM_OF[200]=codex
+}
+PROCESS_SNAPSHOT_AT_US=0
+MOCK_CAPTURE="$APPROVAL_SCREEN"
+tm() {
+  if [ "$1" = capture-pane ] && [ "${*: -1}" = %2 ]; then printf 'Command running\n'; return; fi
+  if [ "$1" = capture-pane ]; then printf '%s\n' "$MOCK_CAPTURE"; return; fi
+  tm_without_approval "$@"
+}
+reconcile
+assert_eq "$ICON_WAITING" "$STATUS_VALUE" 'visible approval should override working'
+assert_eq "1:$ICON_WAITING" "$SUMMARY_VALUE" 'approval should appear in session summary'
+MOCK_CAPTURE='Command running'
+reconcile
+assert_eq "$ICON_WORKING" "$STATUS_VALUE" 'approving should restore working while command runs'
+assert_eq "1:$ICON_WORKING" "$SUMMARY_VALUE" 'summary should stop waiting when prompt closes'
+
+eval "$(declare -f snapshot_without_approval | sed '1s/^snapshot_without_approval /snapshot_processes /')"
+PROCESS_SNAPSHOT_AT_US=0
 # Seeing a completion clears only the done icon. The boundary timestamp remains
 # available to consumers such as workspace-tree instead of falling back to pane
 # output activity, and remains stable on later polls.
